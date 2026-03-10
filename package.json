@@ -1,0 +1,15 @@
+{
+  "name": "webauthn",
+  "version": "1.0.0",
+  "description": "Compact Python WebAuthn assessment tool that combines: - Chromium CDP virtual authenticators (browser-visible authenticator layer) - Playwright (automation + CDP session) - `python-fido2` (CBOR/WebAuthn structure parsing and mutation helpers)",
+  "main": "index.js",
+  "scripts": {},
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "devDependencies": {
+    "@playwright/test": "^1.58.2",
+    "@types/node": "^25.4.0"
+  }
+}
