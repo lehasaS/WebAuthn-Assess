@@ -17,11 +17,18 @@ def _utc_now() -> str:
 @dataclass(slots=True)
 class SubmissionRecord:
     timestamp: str
+    request_id: str
     method: str
     url: str
     mutated: bool
+    request_headers: dict[str, Any] | None
+    request_body: str | None
+    frame: dict[str, Any] | None
     original_json: dict[str, Any] | list[Any] | None
     final_json: dict[str, Any] | list[Any] | None
+    mutation_details: list[str] | None = None
+    mutation_errors: list[str] | None = None
+    mutation_diff: dict[str, Any] | None = None
     parse_error: str | None = None
 
 
@@ -43,6 +50,7 @@ class StateStore:
             "virtual_credentials": [],
             "submissions": [],
             "responses": [],
+            "profile_history": [],
         }
 
     def _load(self) -> dict[str, Any]:
@@ -124,11 +132,18 @@ class StateStore:
         submissions.append(
             {
                 "timestamp": submission.timestamp,
+                "request_id": submission.request_id,
                 "method": submission.method,
                 "url": submission.url,
                 "mutated": submission.mutated,
+                "request_headers": submission.request_headers,
+                "request_body": submission.request_body,
+                "frame": submission.frame,
                 "original_json": submission.original_json,
                 "final_json": submission.final_json,
+                "mutation_details": submission.mutation_details,
+                "mutation_errors": submission.mutation_errors,
+                "mutation_diff": submission.mutation_diff,
                 "parse_error": submission.parse_error,
             }
         )
@@ -216,6 +231,13 @@ class StateStore:
                     changed = True
         if changed:
             self._autosave()
+
+    def record_profile_run(self, item: dict[str, Any]) -> None:
+        history = self._data.setdefault("profile_history", [])
+        history.append(item)
+        if len(history) > 200:
+            del history[:-200]
+        self._autosave()
 
 
 def _extract_sign_count(authenticator_data_b64url: str) -> int | None:

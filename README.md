@@ -41,6 +41,11 @@ pip install -e .
 playwright install chromium
 ```
 
+## Documentation
+
+- Architecture, design, and protocol notes: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+- Pentest testing methodology and interpretation: [docs/TESTING_METHODOLOGY.md](docs/TESTING_METHODOLOGY.md)
+
 ## CLI
 
 ### Baseline
@@ -91,7 +96,7 @@ webauthn-assess clone --credential <credential-id>
 
 - `--trigger-js "<script>"`: run JS after load to trigger app ceremony
 - `--wait-seconds 20`: wait window for ceremony capture
-- Mutation mode auto-stops after the first captured WebAuthn submission (use `--allow-retries` to keep observing retries)
+- Mutation mode uses profile-specific stop guards by default (use `--allow-retries` to disable them)
 - `--headless`: run without UI
 - `--verbose`: stream live request/response and mutation logs in terminal
 - `--proxy http://127.0.0.1:8080`: route traffic through local proxy/Burp
@@ -109,9 +114,22 @@ Authenticator knobs:
 - `--uv-state on|off`
 - `--presence-sim on|off`
 
-Mutation knobs:
+Termination/loop guards:
+- `--max-attempts`
+- `--stop-on-first-submission` / `--no-stop-on-first-submission`
+- `--stop-on-first-response` / `--no-stop-on-first-response`
+- `--stop-on-response-error` / `--no-stop-on-response-error`
+- `--stop-on-first-cdp-event` / `--no-stop-on-first-cdp-event`
+- `--allow-retries` (disables profile defaults)
+
+Pre-ceremony mutation knobs:
+- `--rp-id-override`
+- `--alg-override`
+- `--attestation-request-mode`
+
+Post-ceremony mutation knobs:
 - `--tamper-origin`
-- `--tamper-challenge`
+- `--tamper-challenge` (`last-assertion,last-registration,stale,random,empty,null,missing,<explicit>`)
 - `--tamper-type`
 - `--force-uv on|off`
 - `--force-up on|off`
@@ -120,8 +138,6 @@ Mutation knobs:
 - `--clear-x5c`
 - `--inject-untrusted-x5c`
 - `--duplicate-credential-id`
-- `--rp-id-override`
-- `--alg-override`
 
 ## Profiles
 
@@ -148,10 +164,40 @@ Mutation knobs:
 
 Reports include:
 - JS ceremony events
+- JS hook install status / capture status
 - CDP authenticator events
+- correlated request/response ids with headers/body previews
 - original vs final request JSON bodies
-- mutation details/errors
-- response previews
+- mutation details/errors and structured diffs
+- transport/application-level response classification
+- final state capture (URL/component/error text preview)
+- loop detection and challenge reissue observations
+
+## Assessment checklist (recommended order)
+
+1. Baseline register (`--mode normal --profile baseline`).
+2. Baseline auth with `--preload-credential`.
+3. Run failure-oriented integrity tests:
+   - `origin-mismatch`
+   - `tamper-type`
+   - challenge tamper (`random`, `empty`, `null`, `missing`)
+4. Run policy tests:
+   - UV semantics (`--uv off`, `uv-downgrade`)
+   - RP-ID/origin scoping (`rp-id-mismatch`)
+   - attestation policy (`attestation-none`, `attestation-untrusted`)
+   - algorithm policy (`alg-unexpected`)
+5. Replay analysis with `replay --repeat --interval-ms` as needed.
+6. Inspect collected state with `inspect-state`.
+
+## Result interpretation
+
+- `accepted`: assertion/attestation accepted and flow progressed.
+- `rejected`: backend rejected the WebAuthn submission.
+- `rejected with retry`: rejection plus frontend retry loop detected.
+- `redirected`: accepted and navigated to a different post-auth URL.
+- `unknown`: capture insufficient to assert an outcome.
+
+A common pattern is HTTP `200` with JSON `response_errors`; this is classified as application-level rejection, not success.
 
 ## How it works (and why)
 

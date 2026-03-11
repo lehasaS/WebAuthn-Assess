@@ -32,6 +32,13 @@ class AuthenticatorConfig:
 @dataclass(slots=True)
 class MutationConfig:
     enabled: bool = False
+    # Pre-ceremony request mutation.
+    rp_id_override: str | None = None
+    algorithm_override: int | None = None
+    attestation_request_mode_override: Literal[
+        "none", "direct", "indirect", "enterprise"
+    ] | None = None
+    # Post-ceremony submission mutation.
     tamper_origin: str | None = None
     tamper_challenge: str | None = None
     tamper_type: str | None = None
@@ -42,14 +49,41 @@ class MutationConfig:
     clear_attestation_x5c: bool = False
     inject_untrusted_x5c: bool = False
     duplicate_credential_id: bool = False
-    rp_id_override: str | None = None
-    algorithm_override: int | None = None
 
     def as_script_options(self) -> dict[str, Any]:
+        pre_enabled = any(
+            [
+                self.rp_id_override,
+                self.algorithm_override is not None,
+                self.attestation_request_mode_override,
+            ]
+        )
         return {
-            "enabled": self.enabled,
+            "enabled": self.enabled and pre_enabled,
             "rpIdOverride": self.rp_id_override,
             "algorithmOverride": self.algorithm_override,
+            "attestationRequestModeOverride": self.attestation_request_mode_override,
+        }
+
+    def pre_ceremony_summary(self) -> dict[str, Any]:
+        return {
+            "rp_id_override": self.rp_id_override,
+            "algorithm_override": self.algorithm_override,
+            "attestation_request_mode_override": self.attestation_request_mode_override,
+        }
+
+    def post_ceremony_summary(self) -> dict[str, Any]:
+        return {
+            "tamper_origin": self.tamper_origin,
+            "tamper_challenge": self.tamper_challenge,
+            "tamper_type": self.tamper_type,
+            "force_uv_flag": self.force_uv_flag,
+            "force_up_flag": self.force_up_flag,
+            "sign_count_mode": self.sign_count_mode,
+            "attestation_fmt": self.attestation_fmt,
+            "clear_attestation_x5c": self.clear_attestation_x5c,
+            "inject_untrusted_x5c": self.inject_untrusted_x5c,
+            "duplicate_credential_id": self.duplicate_credential_id,
         }
 
 
@@ -64,7 +98,13 @@ class RunConfig:
     verbose: bool = False
     trigger_js: str | None = None
     wait_seconds: float = 15.0
-    stop_after_first_webauthn: bool = False
+    max_attempts: int | None = None
+    stop_on_first_submission: bool = False
+    stop_on_first_response: bool = False
+    stop_on_response_error: bool = False
+    stop_on_first_cdp_event: bool = False
+    loop_detection_window_seconds: float = 6.0
+    loop_detection_threshold: int = 3
     headless: bool = False
     timeout_ms: int = 30_000
     proxy: str | None = None

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import signal
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -9,7 +10,7 @@ from typing import Any
 
 from .config import AuthenticatorConfig, RunConfig
 from .persistence import atomic_write_json
-from .profiles import get_profile, profile_names
+from .profiles import ProfileDefaults, get_profile, get_profile_defaults, profile_names
 from .replay import replay_submission, select_submission
 from .state import StateStore
 
@@ -24,6 +25,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_replay(args)
     if args.command == "clone":
         return _run_clone(args)
+    if args.command == "inspect-state":
+        return _run_inspect_state(args)
 
     parser.print_help()
     return 1
@@ -45,7 +48,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--uv",
         choices=["on", "off", "spoof"],
         default=None,
-        help="Set UV state or spoof UV flag in mutation mode",
+        help="Authenticator state: set real UV state or request post-ceremony UV spoof mutation",
     )
 
     replay = subparsers.add_parser("replay", help="Replay a stored captured payload")
@@ -58,6 +61,22 @@ def build_parser() -> argparse.ArgumentParser:
     replay.add_argument("--url", dest="url_override", help="Override replay target URL")
     replay.add_argument("--proxy", help="Proxy URL for replay request")
     replay.add_argument("--timeout-seconds", type=int, default=30)
+    replay.add_argument("--method", help="Override HTTP method (default: captured method)")
+    replay.add_argument(
+        "--header",
+        action="append",
+        default=[],
+        help="Override/add replay header as KEY:VALUE (repeatable)",
+    )
+    replay.add_argument("--cookie", help="Override Cookie header")
+    replay.add_argument(
+        "--json-override",
+        action="append",
+        default=[],
+        help="Override replay JSON body path as path.to.field=jsonValue (repeatable)",
+    )
+    replay.add_argument("--repeat", type=int, default=1, help="Replay count")
+    replay.add_argument("--interval-ms", type=int, default=0, help="Replay interval milliseconds")
     replay.add_argument(
         "--state-path",
         type=Path,
@@ -75,6 +94,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path(".webauthn_assess/state.json"),
         help="State file path",
     )
+
+    inspect_state = subparsers.add_parser("inspect-state", help="Inspect stored state and credential metadata")
+    inspect_state.add_argument(
+        "--state-path",
+        type=Path,
+        default=Path(".webauthn_assess/state.json"),
+        help="State file path",
+    )
+    inspect_state.add_argument("--json", action="store_true", help="Print full state JSON")
 
     return parser
 
@@ -95,22 +123,42 @@ def _add_browser_args(parser: argparse.ArgumentParser, ceremony: str) -> None:
         type=int,
         help="Resolve CDP URL from a running Chromium PID (requires --remote-debugging-port)",
     )
-    parser.add_argument(
-        "--mode", choices=["normal", "mutation"], default="normal", help="Execution mode"
-    )
-    parser.add_argument(
-        "--profile",
-        choices=profile_names(),
-        default="baseline",
-        help="Mutation profile",
-    )
+    parser.add_argument("--mode", choices=["normal", "mutation"], default="normal", help="Execution mode")
+    parser.add_argument("--profile", choices=profile_names(), default="baseline", help="Mutation profile")
     parser.add_argument("--trigger-js", help="JavaScript snippet to trigger ceremony in page context")
     parser.add_argument("--wait-seconds", type=float, default=15.0, help="Wait window after page load")
     parser.add_argument(
         "--allow-retries",
         action="store_true",
-        help="Do not auto-stop after first captured WebAuthn submission in mutation mode",
+        help="Disable profile defaults that stop on first meaningful failure (legacy convenience toggle)",
     )
+
+    parser.add_argument("--max-attempts", type=int, help="Guard: max captured WebAuthn submissions before stop")
+    parser.add_argument(
+        "--stop-on-first-submission",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Guard: stop as soon as first WebAuthn submission is captured",
+    )
+    parser.add_argument(
+        "--stop-on-first-response",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Guard: stop as soon as first correlated response is captured",
+    )
+    parser.add_argument(
+        "--stop-on-response-error",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Guard: stop when application-level response classification is rejected",
+    )
+    parser.add_argument(
+        "--stop-on-first-cdp-event",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Guard: stop on first CDP credentialAdded/credentialAsserted event",
+    )
+
     parser.add_argument("--headless", action="store_true", help="Launch Chromium in headless mode")
     parser.add_argument("--timeout-ms", type=int, default=30_000, help="Playwright timeout in milliseconds")
     parser.add_argument("--proxy", help="Proxy server URL for browser traffic")
@@ -128,28 +176,103 @@ def _add_browser_args(parser: argparse.ArgumentParser, ceremony: str) -> None:
         help="State file path",
     )
 
-    parser.add_argument("--protocol", choices=["ctap2", "u2f"], default="ctap2")
-    parser.add_argument("--transport", choices=["usb", "nfc", "ble", "internal"], default="usb")
-    parser.add_argument("--resident-key", choices=["on", "off"], default="on")
-    parser.add_argument("--uv-support", choices=["on", "off"], default="on")
-    parser.add_argument("--uv-state", choices=["on", "off"], default="on")
-    parser.add_argument("--presence-sim", choices=["on", "off"], default="on")
+    parser.add_argument(
+        "--protocol",
+        choices=["ctap2", "u2f"],
+        default="ctap2",
+        help="Authenticator state: virtual authenticator protocol",
+    )
+    parser.add_argument(
+        "--transport",
+        choices=["usb", "nfc", "ble", "internal"],
+        default="usb",
+        help="Authenticator state: virtual authenticator transport",
+    )
+    parser.add_argument(
+        "--resident-key",
+        choices=["on", "off"],
+        default="on",
+        help="Authenticator state: resident key capability",
+    )
+    parser.add_argument(
+        "--uv-support",
+        choices=["on", "off"],
+        default="on",
+        help="Authenticator state: whether authenticator advertises UV capability",
+    )
+    parser.add_argument(
+        "--uv-state",
+        choices=["on", "off"],
+        default="on",
+        help="Authenticator state: real user verified state in virtual authenticator",
+    )
+    parser.add_argument(
+        "--presence-sim",
+        choices=["on", "off"],
+        default="on",
+        help="Authenticator state: automatic presence simulation",
+    )
 
-    parser.add_argument("--tamper-origin", help="Replace clientDataJSON.origin")
+    parser.add_argument(
+        "--rp-id-override",
+        help="Pre-ceremony mutation: replace publicKey.rp.id / rpId before browser ceremony",
+    )
+    parser.add_argument(
+        "--alg-override",
+        type=int,
+        help="Pre-ceremony mutation: replace publicKey.pubKeyCredParams algorithm list",
+    )
+    parser.add_argument(
+        "--attestation-request-mode",
+        choices=["none", "direct", "indirect", "enterprise"],
+        help="Pre-ceremony mutation: override registration attestation request mode",
+    )
+
+    parser.add_argument(
+        "--tamper-origin",
+        help="Post-ceremony mutation: rewrite clientDataJSON.origin before submission",
+    )
     parser.add_argument(
         "--tamper-challenge",
-        help="Replace clientDataJSON.challenge with stale/random/or explicit value",
+        help=(
+            "Post-ceremony mutation: challenge mode "
+            "(last-assertion,last-registration,stale,random,empty,null,missing,<explicit-value>)"
+        ),
     )
-    parser.add_argument("--tamper-type", help="Replace clientDataJSON.type")
-    parser.add_argument("--force-uv", choices=["on", "off"], help="Force UV flag in authenticatorData")
-    parser.add_argument("--force-up", choices=["on", "off"], help="Force UP flag in authenticatorData")
-    parser.add_argument("--sign-count-mode", choices=["stall", "rollback"])
-    parser.add_argument("--attestation-fmt", help="Override attestationObject fmt field")
-    parser.add_argument("--clear-x5c", action="store_true", help="Remove attStmt.x5c")
-    parser.add_argument("--inject-untrusted-x5c", action="store_true")
-    parser.add_argument("--duplicate-credential-id", action="store_true")
-    parser.add_argument("--rp-id-override", help="Override RP ID in JS options before signing")
-    parser.add_argument("--alg-override", type=int, help="Override pubKeyCredParams algorithm")
+    parser.add_argument(
+        "--tamper-type",
+        help="Post-ceremony mutation: rewrite clientDataJSON.type before submission",
+    )
+    parser.add_argument(
+        "--force-uv",
+        choices=["on", "off"],
+        help="Post-ceremony mutation: force UV flag in authenticatorData",
+    )
+    parser.add_argument(
+        "--force-up",
+        choices=["on", "off"],
+        help="Post-ceremony mutation: force UP flag in authenticatorData",
+    )
+    parser.add_argument(
+        "--sign-count-mode",
+        choices=["stall", "rollback"],
+        help="Post-ceremony mutation: force signCount stall/rollback",
+    )
+    parser.add_argument(
+        "--attestation-fmt",
+        help="Post-ceremony mutation: override attestationObject fmt field",
+    )
+    parser.add_argument("--clear-x5c", action="store_true", help="Post-ceremony mutation: remove attStmt.x5c")
+    parser.add_argument(
+        "--inject-untrusted-x5c",
+        action="store_true",
+        help="Post-ceremony mutation: inject synthetic untrusted x5c chain",
+    )
+    parser.add_argument(
+        "--duplicate-credential-id",
+        action="store_true",
+        help="Post-ceremony mutation: duplicate credential id from prior state",
+    )
 
     if ceremony == "register":
         parser.add_argument(
@@ -173,6 +296,7 @@ def _run_browser_command(args: argparse.Namespace) -> int:
 
     state = StateStore(args.state_path)
     mutation = get_profile(args.profile)
+    profile_defaults = get_profile_defaults(args.profile)
     _apply_mutation_overrides(mutation, args)
 
     if args.cdp_url and args.attach_pid is not None:
@@ -198,6 +322,17 @@ def _run_browser_command(args: argparse.Namespace) -> int:
         if mutation.force_up_flag is None:
             mutation.force_up_flag = True
 
+    fallback_failure_defaults = ProfileDefaults(
+        expected_outcome="expected-failure",
+        max_attempts=1,
+        stop_on_first_response=True,
+        stop_on_response_error=True,
+    )
+    if _has_failure_oriented_override(args):
+        profile_defaults = _merge_profile_defaults(profile_defaults, fallback_failure_defaults)
+
+    stop_cfg = _resolve_stop_guards(args, mode, profile_defaults)
+
     authenticator = AuthenticatorConfig(
         protocol=args.protocol,
         transport=args.transport,
@@ -222,7 +357,11 @@ def _run_browser_command(args: argparse.Namespace) -> int:
         verbose=args.verbose,
         trigger_js=args.trigger_js,
         wait_seconds=args.wait_seconds,
-        stop_after_first_webauthn=(mode == "mutation" and not args.allow_retries),
+        max_attempts=stop_cfg["max_attempts"],
+        stop_on_first_submission=stop_cfg["stop_on_first_submission"],
+        stop_on_first_response=stop_cfg["stop_on_first_response"],
+        stop_on_response_error=stop_cfg["stop_on_response_error"],
+        stop_on_first_cdp_event=stop_cfg["stop_on_first_cdp_event"],
         headless=args.headless,
         timeout_ms=args.timeout_ms,
         proxy=args.proxy,
@@ -235,6 +374,19 @@ def _run_browser_command(args: argparse.Namespace) -> int:
 
     try:
         with _graceful_interrupts():
+            state.record_profile_run(
+                {
+                    "timestamp": datetime.now(UTC).isoformat(),
+                    "command": args.command,
+                    "profile": args.profile,
+                    "mode": mode,
+                    "url": args.url,
+                    "defaults": {
+                        "expected_outcome": profile_defaults.expected_outcome,
+                        **stop_cfg,
+                    },
+                }
+            )
             report = WebAuthnRunner(cfg, state).run()
     except KeyboardInterrupt:
         print(f"report: {output_path}")
@@ -253,6 +405,10 @@ def _run_browser_command(args: argparse.Namespace) -> int:
     mutated = sum(1 for s in report.get("submissions", []) if s.get("mutated"))
     print(f"mutated submissions: {mutated}")
     print(f"responses: {len(report.get('responses', []))}")
+    if report.get("capture_status"):
+        print(f"capture status: {report['capture_status']}")
+    if report.get("result_classification"):
+        print(f"result classification: {report['result_classification']}")
     if report.get("errors"):
         print("errors:")
         for err in report["errors"]:
@@ -272,11 +428,24 @@ def _run_replay(args: argparse.Namespace) -> int:
         print(f"no submission matched selector: {args.capture}")
         return 1
 
+    try:
+        headers = _parse_header_overrides(args.header)
+        json_overrides = _parse_json_overrides(args.json_override)
+    except ValueError as exc:
+        print(str(exc))
+        return 1
+
     result = replay_submission(
         submission=submission,
         url_override=args.url_override,
         proxy=args.proxy,
         timeout_seconds=args.timeout_seconds,
+        method_override=args.method,
+        header_overrides=headers,
+        cookie_override=args.cookie,
+        json_overrides=json_overrides,
+        repeat_count=args.repeat,
+        interval_ms=args.interval_ms,
     )
     result["replayed_at"] = datetime.now(UTC).isoformat()
     result["capture"] = args.capture
@@ -288,6 +457,7 @@ def _run_replay(args: argparse.Namespace) -> int:
 
     print(f"replay status: {result['status']} ok={result['ok']}")
     print(f"target: {result['url']}")
+    print(f"attempts: {len(result.get('attempts', []))}")
     return 0 if result["ok"] else 2
 
 
@@ -299,6 +469,77 @@ def _run_clone(args: argparse.Namespace) -> int:
         print(f"credential not found: {args.credential}")
         return 1
     print(f"cloned credential {args.credential} -> {clone_id}")
+    return 0
+
+
+def _run_inspect_state(args: argparse.Namespace) -> int:
+    state = StateStore(args.state_path)
+    data = state.data
+    if args.json:
+        print(json.dumps(data, indent=2, sort_keys=True))
+        return 0
+
+    credentials = data.get("credentials", {})
+    virtual = data.get("virtual_credentials", [])
+    profile_history = data.get("profile_history", [])
+
+    print(f"state path: {args.state_path}")
+    print(f"credentials: {len(credentials) if isinstance(credentials, dict) else 0}")
+    if isinstance(credentials, dict):
+        for cred_id, item in credentials.items():
+            sign_count = item.get("signCount") if isinstance(item, dict) else None
+            cloned_from = item.get("cloned_from") if isinstance(item, dict) else None
+            print(f"  - id={cred_id} signCount={sign_count} cloned_from={cloned_from}")
+
+    print(f"virtual credentials: {len(virtual) if isinstance(virtual, list) else 0}")
+    if isinstance(virtual, list):
+        for item in virtual:
+            if not isinstance(item, dict):
+                continue
+            print(
+                "  - "
+                f"credentialId={item.get('credentialId')} "
+                f"rpId={item.get('rpId')} "
+                f"signCount={item.get('signCount')} "
+                f"cloned_from={item.get('cloned_from')}"
+            )
+
+    last_registration = data.get("last_registration")
+    last_assertion = data.get("last_assertion")
+    print(f"last registration present: {bool(last_registration)}")
+    if isinstance(last_registration, dict):
+        response = last_registration.get("response")
+        keys = sorted(response.keys()) if isinstance(response, dict) else []
+        print(
+            "  - "
+            f"id={last_registration.get('id')} "
+            f"type={last_registration.get('type')} "
+            f"response_keys={keys}"
+        )
+    print(f"last assertion present: {bool(last_assertion)}")
+    if isinstance(last_assertion, dict):
+        response = last_assertion.get("response")
+        keys = sorted(response.keys()) if isinstance(response, dict) else []
+        print(
+            "  - "
+            f"id={last_assertion.get('id')} "
+            f"type={last_assertion.get('type')} "
+            f"response_keys={keys}"
+        )
+    print(f"submissions stored: {len(data.get('submissions', []))}")
+    print(f"responses stored: {len(data.get('responses', []))}")
+    print(f"profile history entries: {len(profile_history) if isinstance(profile_history, list) else 0}")
+    if isinstance(profile_history, list) and profile_history:
+        for item in profile_history[-10:]:
+            if not isinstance(item, dict):
+                continue
+            print(
+                "  - "
+                f"{item.get('timestamp')} "
+                f"{item.get('command')} "
+                f"profile={item.get('profile')} "
+                f"mode={item.get('mode')}"
+            )
     return 0
 
 
@@ -319,6 +560,7 @@ def _apply_mutation_overrides(mutation, args: argparse.Namespace) -> None:
     set_attr("attestation_fmt", args.attestation_fmt)
     set_attr("rp_id_override", args.rp_id_override)
     set_attr("algorithm_override", args.alg_override)
+    set_attr("attestation_request_mode_override", args.attestation_request_mode)
 
     if getattr(args, "force_uv", None):
         mutation.force_uv_flag = args.force_uv == "on"
@@ -339,6 +581,7 @@ def _apply_mutation_overrides(mutation, args: argparse.Namespace) -> None:
     attestation = getattr(args, "attestation", None)
     if attestation:
         explicit = True
+        mutation.attestation_request_mode_override = attestation
         if attestation == "none":
             mutation.attestation_fmt = "none"
             mutation.clear_attestation_x5c = True
@@ -356,6 +599,111 @@ def _default_report_path(ceremony: str, profile: str) -> Path:
     ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     name = f"{ts}-{ceremony}-{profile}.json"
     return Path(".webauthn_assess/reports") / name
+
+
+def _has_failure_oriented_override(args: argparse.Namespace) -> bool:
+    return bool(
+        getattr(args, "tamper_origin", None)
+        or getattr(args, "tamper_type", None)
+        or getattr(args, "tamper_challenge", None)
+        or getattr(args, "force_uv", None)
+        or getattr(args, "force_up", None)
+        or getattr(args, "clear_x5c", False)
+        or getattr(args, "inject_untrusted_x5c", False)
+        or getattr(args, "attestation", None)
+    )
+
+
+def _merge_profile_defaults(base: ProfileDefaults, override: ProfileDefaults) -> ProfileDefaults:
+    return ProfileDefaults(
+        expected_outcome=(
+            override.expected_outcome
+            if base.expected_outcome in {"unknown", "baseline"}
+            else base.expected_outcome
+        ),
+        max_attempts=base.max_attempts if base.max_attempts is not None else override.max_attempts,
+        stop_on_first_submission=base.stop_on_first_submission or override.stop_on_first_submission,
+        stop_on_first_response=base.stop_on_first_response or override.stop_on_first_response,
+        stop_on_response_error=base.stop_on_response_error or override.stop_on_response_error,
+        stop_on_first_cdp_event=base.stop_on_first_cdp_event or override.stop_on_first_cdp_event,
+    )
+
+
+def _resolve_stop_guards(
+    args: argparse.Namespace,
+    mode: str,
+    defaults: ProfileDefaults,
+) -> dict[str, Any]:
+    max_attempts = args.max_attempts if args.max_attempts is not None else defaults.max_attempts
+    stop_on_first_submission = _resolve_bool_arg(
+        args.stop_on_first_submission, defaults.stop_on_first_submission
+    )
+    stop_on_first_response = _resolve_bool_arg(
+        args.stop_on_first_response, defaults.stop_on_first_response
+    )
+    stop_on_response_error = _resolve_bool_arg(
+        args.stop_on_response_error, defaults.stop_on_response_error
+    )
+    stop_on_first_cdp_event = _resolve_bool_arg(
+        args.stop_on_first_cdp_event, defaults.stop_on_first_cdp_event
+    )
+
+    if args.allow_retries:
+        max_attempts = None
+        stop_on_first_submission = False
+        stop_on_first_response = False
+        stop_on_response_error = False
+        stop_on_first_cdp_event = False
+
+    if mode != "mutation" and defaults.expected_outcome == "baseline":
+        # Baseline should still stop after first completed correlated exchange.
+        stop_on_first_response = True if args.stop_on_first_response is None else stop_on_first_response
+        if max_attempts is None:
+            max_attempts = 1
+
+    return {
+        "max_attempts": max_attempts,
+        "stop_on_first_submission": stop_on_first_submission,
+        "stop_on_first_response": stop_on_first_response,
+        "stop_on_response_error": stop_on_response_error,
+        "stop_on_first_cdp_event": stop_on_first_cdp_event,
+    }
+
+
+def _resolve_bool_arg(value: bool | None, default: bool) -> bool:
+    if value is None:
+        return default
+    return bool(value)
+
+
+def _parse_header_overrides(items: list[str]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for item in items:
+        if ":" not in item:
+            raise ValueError(f"invalid --header value '{item}', expected KEY:VALUE")
+        key, value = item.split(":", 1)
+        out[key.strip()] = value.strip()
+    return out
+
+
+def _parse_json_overrides(items: list[str]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for item in items:
+        if "=" not in item:
+            raise ValueError(
+                f"invalid --json-override value '{item}', expected path.to.field=jsonValue"
+            )
+        path, raw = item.split("=", 1)
+        path = path.strip()
+        raw = raw.strip()
+        if not path:
+            raise ValueError("json override path cannot be empty")
+        try:
+            value = json.loads(raw)
+        except Exception:
+            value = raw
+        out[path] = value
+    return out
 
 
 @contextmanager

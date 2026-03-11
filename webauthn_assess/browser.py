@@ -14,6 +14,12 @@ from .config import RunConfig
 from .instrumentation import build_init_script
 from .mutation import contains_webauthn_payload, mutate_json_payload
 from .persistence import atomic_write_json
+from .reporting import (
+    build_mutation_diff,
+    classify_application_response,
+    extract_challenges,
+    stable_body_fingerprint,
+)
 from .state import StateStore, SubmissionRecord
 
 
@@ -21,10 +27,23 @@ def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def _to_epoch_seconds(ts: str | None) -> float | None:
+    if not isinstance(ts, str):
+        return None
+    try:
+        return datetime.fromisoformat(ts).timestamp()
+    except Exception:
+        return None
+
+
 class WebAuthnRunner:
     def __init__(self, run_config: RunConfig, state: StateStore) -> None:
         self.cfg = run_config
         self.state = state
+        self._request_ids: dict[str, str] = {}
+        self._recent_cycles: list[dict[str, Any]] = []
+        self._challenge_last_seen: dict[str, str] = {}
+        self._seen_js_event_keys: set[str] = set()
 
     def _log(self, message: str) -> None:
         if not self.cfg.verbose:
@@ -66,13 +85,22 @@ class WebAuthnRunner:
             "mode": self.cfg.mode,
             "profile": self.cfg.profile,
             "url": self.cfg.url,
-            "authenticator": asdict(self.cfg.authenticator),
-            "mutation": asdict(self.cfg.mutation),
+            "authenticator_state": asdict(self.cfg.authenticator),
+            "pre_ceremony_mutation": self.cfg.mutation.pre_ceremony_summary(),
+            "post_ceremony_mutation": self.cfg.mutation.post_ceremony_summary(),
             "js_events": [],
+            "js_hook_status": {},
+            "capture_status": "unknown",
             "cdp_events": [],
             "submissions": [],
             "responses": [],
+            "browser_console": [],
+            "challenge_observations": [],
+            "loop_detection": {"detected": False, "signature": None, "count": 0},
             "errors": [],
+            "stop_reason": None,
+            "result_classification": "unknown",
+            "final_state": {},
         }
         self._flush_report(report, reason="start")
 
@@ -96,8 +124,10 @@ class WebAuthnRunner:
                 )
                 try:
                     page.set_default_timeout(self.cfg.timeout_ms)
-                    page.add_init_script(build_init_script(self.cfg.mutation))
+                    context.add_init_script(build_init_script(self.cfg.mutation, self.cfg.verbose))
+                    page.add_init_script(build_init_script(self.cfg.mutation, self.cfg.verbose))
 
+                    self._install_page_debug_hooks(page, report)
                     self._install_network_hooks(context, report)
                     self._install_response_hook(context, report)
 
@@ -108,7 +138,7 @@ class WebAuthnRunner:
                         self._record_error(report, f"CDP setup failed: {exc}")
 
                     if authenticator_id:
-                        self._attach_cdp_event_listeners(cdp, report)
+                        self._attach_cdp_event_listeners(cdp, page, report)
 
                     try:
                         self._log("navigating to target page")
@@ -124,20 +154,17 @@ class WebAuthnRunner:
                                 self._log("trigger JS returned")
                             except Exception as exc:
                                 self._record_error(report, f"Trigger JS failed: {exc}")
+
                         self._log(f"waiting {self.cfg.wait_seconds:.1f}s for ceremony activity")
                         self._wait_for_activity(page, report)
 
-                        report["js_events"] = self._collect_js_events(page)
-                        for event in report["js_events"]:
-                            self.state.update_from_js_event(event)
-                        self._flush_report(report, reason="js-events")
-                        self._log(f"captured {len(report['js_events'])} JS ceremony events")
-                        if self.cfg.verbose:
-                            for event in report["js_events"]:
-                                stage = event.get("stage")
-                                ceremony = event.get("ceremony")
-                                seq = event.get("seq")
-                                self._log(f"js event seq={seq} ceremony={ceremony} stage={stage}")
+                        self._capture_js_snapshot(page, report, reason="js-events")
+                        self._attach_browser_event_correlation(report)
+                        self._assess_js_capture(report)
+                        self._capture_final_state(page, report)
+                        self._classify_result(report)
+                        self._flush_report(report, reason="post-capture")
+                        self._log(f"captured {len(report['js_events'])} JS events")
                 finally:
                     if authenticator_id and cdp is not None:
                         self._collect_virtual_credentials(cdp, authenticator_id, report)
@@ -253,7 +280,6 @@ class WebAuthnRunner:
                 },
             )
         except Exception:
-            # This command can be unsupported in older Chrome versions.
             pass
 
         try:
@@ -265,7 +291,6 @@ class WebAuthnRunner:
                 },
             )
         except Exception:
-            # Optional command.
             pass
 
         if self.cfg.preload_credential_ids:
@@ -273,11 +298,16 @@ class WebAuthnRunner:
 
         return authenticator_id
 
-    def _attach_cdp_event_listeners(self, cdp: CDPSession, report: dict[str, Any]) -> None:
+    def _attach_cdp_event_listeners(
+        self, cdp: CDPSession, page: Page, report: dict[str, Any]
+    ) -> None:
         def _record(name: str):
             def _handler(payload: dict[str, Any]) -> None:
                 report["cdp_events"].append({"event": name, "payload": payload, "ts": _now()})
+                self._capture_js_snapshot(page, report, reason="js-events")
                 self._flush_report(report, reason="cdp-event")
+                if self.cfg.stop_on_first_cdp_event:
+                    self._request_stop(report, f"captured first CDP event: {name}")
                 if self.cfg.verbose:
                     self._log(f"cdp event {name}")
 
@@ -355,26 +385,276 @@ class WebAuthnRunner:
             report["preloaded_credentials"] = preloaded
             self._log(f"preloaded credentials count={len(preloaded)}")
 
+    def _install_page_debug_hooks(self, page: Page, report: dict[str, Any]) -> None:
+        def on_console(message) -> None:
+            text = message.text
+            is_js_hook_log = "[webauthn-assess-js]" in text
+            if is_js_hook_log:
+                self._capture_js_snapshot(page, report, reason="js-events")
+            if "[webauthn-assess-js]" not in text and not self.cfg.verbose:
+                return
+            entry = {
+                "timestamp": _now(),
+                "type": message.type,
+                "text": text,
+                "location": message.location,
+            }
+            report["browser_console"].append(entry)
+            if self.cfg.verbose:
+                self._log(f"console[{message.type}] {text}")
+            self._flush_report(report, reason="console")
+
+        def on_page_error(exc) -> None:
+            text = str(exc)
+            entry = {"timestamp": _now(), "type": "pageerror", "text": text}
+            report["browser_console"].append(entry)
+            self._record_error(report, f"Page error: {text}")
+
+        page.on("console", on_console)
+        page.on("pageerror", on_page_error)
+
     def _collect_js_events(self, page: Page) -> list[dict[str, Any]]:
+        collected: list[dict[str, Any]] = []
+        for frame in page.frames:
+            try:
+                events = frame.evaluate(
+                    "() => (window.__webauthnAssess ? window.__webauthnAssess.getEvents() : [])"
+                )
+            except Exception:
+                continue
+            if not isinstance(events, list):
+                continue
+            for event in events:
+                if not isinstance(event, dict):
+                    continue
+                out = dict(event)
+                if "frame" not in out:
+                    out["frame"] = {"href": frame.url}
+                collected.append(out)
+        return collected
+
+    def _collect_js_status(self, page: Page) -> dict[str, Any]:
+        statuses: list[dict[str, Any]] = []
+        for frame in page.frames:
+            try:
+                status = frame.evaluate(
+                    "() => (window.__webauthnAssess ? window.__webauthnAssess.getStatus() : {})"
+                )
+            except Exception:
+                continue
+            if not isinstance(status, dict) or not status:
+                continue
+            out = dict(status)
+            out["frame_url"] = frame.url
+            statuses.append(out)
+
+        if not statuses:
+            return {}
+
+        top_status = next((s for s in statuses if s.get("isTop") is True), statuses[0])
+        merged = dict(top_status)
+        merged["frames"] = statuses
+        return merged
+
+    def _js_event_key(self, event: dict[str, Any]) -> str:
+        seq = event.get("seq")
+        ts = event.get("ts")
+        stage = event.get("stage")
+        method = event.get("method")
+        if isinstance(seq, (int, float)) and isinstance(ts, (int, float)):
+            return f"{int(seq)}:{int(ts)}:{stage}:{method}"
         try:
-            events = page.evaluate(
-                "() => (window.__webauthnAssess ? window.__webauthnAssess.getEvents() : [])"
-            )
-            if isinstance(events, list):
-                return [e for e in events if isinstance(e, dict)]
+            return json.dumps(event, sort_keys=True, separators=(",", ":"))
         except Exception:
-            return []
-        return []
+            return repr(event)
+
+    def _capture_js_snapshot(self, page: Page, report: dict[str, Any], *, reason: str) -> None:
+        events = self._collect_js_events(page)
+        new_events: list[dict[str, Any]] = []
+        for event in events:
+            key = self._js_event_key(event)
+            if key in self._seen_js_event_keys:
+                continue
+            self._seen_js_event_keys.add(key)
+            new_events.append(event)
+
+        if new_events:
+            report["js_events"].extend(new_events)
+            for event in new_events:
+                self.state.update_from_js_event(event)
+            self._flush_report(report, reason=reason)
+
+        status = self._collect_js_status(page)
+        if status:
+            report["js_hook_status"] = status
+
+    def _attach_browser_event_correlation(self, report: dict[str, Any]) -> None:
+        js_results = [
+            event for event in report.get("js_events", [])
+            if event.get("stage") == "result" and isinstance(event.get("credential"), dict)
+        ]
+        if not js_results:
+            return
+        for submission in report.get("submissions", []):
+            ts = _to_epoch_seconds(submission.get("timestamp"))
+            if ts is None:
+                continue
+            match = None
+            best_delta = None
+            for event in js_results:
+                event_ts = event.get("ts")
+                if not isinstance(event_ts, (int, float)):
+                    continue
+                delta = abs(ts - (float(event_ts) / 1000.0))
+                if best_delta is None or delta < best_delta:
+                    best_delta = delta
+                    match = event
+            if match is not None:
+                submission["browser_credential"] = match.get("credential")
+                submission["browser_method"] = match.get("method")
+
+    def _assess_js_capture(self, report: dict[str, Any]) -> None:
+        js_events = report.get("js_events", [])
+        cdp_events = report.get("cdp_events", [])
+        call_events = [e for e in js_events if e.get("stage") == "call"]
+        result_events = [e for e in js_events if e.get("stage") == "result"]
+        error_events = [e for e in js_events if e.get("stage") == "error"]
+        report["js_capture_summary"] = {
+            "calls": len(call_events),
+            "results": len(result_events),
+            "errors": len(error_events),
+        }
+
+        had_ceremony = any(
+            e.get("event") in {"WebAuthn.credentialAdded", "WebAuthn.credentialAsserted"}
+            for e in cdp_events
+        )
+        if had_ceremony and not result_events:
+            report["capture_status"] = "failed"
+            self._record_error(
+                report,
+                "JS hook capture failed: CDP observed WebAuthn ceremony but no JS result events were captured",
+            )
+            return
+        if result_events or call_events:
+            report["capture_status"] = "succeeded"
+            return
+        if had_ceremony:
+            report["capture_status"] = "partial"
+            return
+        report["capture_status"] = "none"
+
+    def _capture_final_state(self, page: Page, report: dict[str, Any]) -> None:
+        try:
+            final_state = page.evaluate(
+                """() => {
+                    const bodyText = (document.body && document.body.innerText) ? document.body.innerText : "";
+                    let component = null;
+                    const selectors = [
+                      "[component]",
+                      "[data-component]",
+                      "ak-stage-authenticator-validate-webauthn",
+                      "ak-stage-authenticator-validate",
+                      "ak-stage-authenticator-webauthn-register"
+                    ];
+                    for (const sel of selectors) {
+                      const node = document.querySelector(sel);
+                      if (!node) continue;
+                      component = node.getAttribute("component") || node.getAttribute("data-component") || node.tagName.toLowerCase();
+                      break;
+                    }
+                    const errorNode = document.querySelector("[role='alert'], .error, .pf-m-danger, .pf-c-alert");
+                    return {
+                      page_url: location.href,
+                      page_title: document.title || null,
+                      component,
+                      error_text: errorNode ? (errorNode.textContent || "").trim() : null,
+                      body_preview: bodyText.slice(0, 1200),
+                    };
+                }"""
+            )
+            if isinstance(final_state, dict):
+                report["final_state"] = final_state
+        except Exception as exc:
+            self._record_error(report, f"Final state capture failed: {exc}")
+
+    def _classify_result(self, report: dict[str, Any]) -> None:
+        submissions = report.get("submissions", [])
+        responses = report.get("responses", [])
+        loop_info = report.get("loop_detection", {})
+        final_state = report.get("final_state", {})
+
+        if not submissions:
+            report["result_classification"] = "unknown due to capture failure"
+            return
+        if not responses:
+            if report.get("stop_reason"):
+                report["result_classification"] = "unknown (stopped before response)"
+            else:
+                report["result_classification"] = "unknown (no correlated response)"
+            return
+
+        last = responses[-1]
+        app_status = last.get("application_status")
+        if app_status == "accepted":
+            page_url = final_state.get("page_url")
+            if isinstance(page_url, str) and page_url != self.cfg.url:
+                report["result_classification"] = "redirected"
+            else:
+                report["result_classification"] = "accepted"
+            return
+        if app_status == "rejected":
+            if loop_info.get("detected"):
+                report["result_classification"] = "rejected with retry"
+            else:
+                report["result_classification"] = "rejected"
+            return
+        report["result_classification"] = "unknown"
 
     def _wait_for_activity(self, page: Page, report: dict[str, Any]) -> None:
         deadline = time.monotonic() + max(0.0, self.cfg.wait_seconds)
         while time.monotonic() < deadline:
+            self._capture_js_snapshot(page, report, reason="js-events")
             if report.get("stop_reason"):
                 break
             remaining_ms = int((deadline - time.monotonic()) * 1000)
             if remaining_ms <= 0:
                 break
             page.wait_for_timeout(min(250, remaining_ms))
+        self._capture_js_snapshot(page, report, reason="js-events")
+
+    def _request_key(self, request) -> str:
+        impl = getattr(request, "_impl_obj", None)
+        guid = getattr(impl, "_guid", None)
+        if isinstance(guid, str) and guid:
+            return guid
+        return f"request-{id(request)}"
+
+    def _request_frame_context(self, request) -> dict[str, Any] | None:
+        try:
+            frame = request.frame
+        except Exception:
+            return None
+        if frame is None:
+            return None
+        out = {"url": frame.url}
+        try:
+            out["name"] = frame.name
+        except Exception:
+            out["name"] = None
+        return out
+
+    def _request_page(self, request) -> Page | None:
+        try:
+            frame = request.frame
+        except Exception:
+            return None
+        if frame is None:
+            return None
+        try:
+            return frame.page
+        except Exception:
+            return None
 
     def _install_network_hooks(
         self, context: BrowserContext, report: dict[str, Any]
@@ -392,9 +672,11 @@ class WebAuthnRunner:
                     return
 
                 parsed_json: dict[str, Any] | list[Any] | None = None
+                parse_error: str | None = None
                 try:
                     parsed_json = json.loads(body)
-                except Exception:
+                except Exception as exc:
+                    parse_error = str(exc)
                     route.continue_()
                     return
 
@@ -405,6 +687,15 @@ class WebAuthnRunner:
                 if not contains_webauthn_payload(parsed_json):
                     route.continue_()
                     return
+
+                if report.get("stop_reason"):
+                    # Guard against frontend auto-retries after we've decided to stop.
+                    route.abort()
+                    return
+
+                req_page = self._request_page(request)
+                if req_page is not None:
+                    self._capture_js_snapshot(req_page, report, reason="js-events")
 
                 original = deepcopy(parsed_json)
                 final_payload = parsed_json
@@ -422,13 +713,23 @@ class WebAuthnRunner:
                     details = log.details
                     errors = log.errors
 
+                request_key = self._request_key(request)
+                request_id = f"req-{len(report['submissions']) + 1:04d}"
+                self._request_ids[request_key] = request_id
+                mutation_diff = build_mutation_diff(original, final_payload)
+
                 submission = {
                     "timestamp": _now(),
+                    "request_id": request_id,
                     "url": request.url,
                     "method": method,
+                    "frame": self._request_frame_context(request),
+                    "request_headers": dict(request.headers),
+                    "request_body": body,
                     "mutated": mutated,
                     "mutation_details": details,
                     "mutation_errors": errors,
+                    "mutation_diff": mutation_diff,
                     "original_json": original,
                     "final_json": final_payload,
                 }
@@ -436,26 +737,35 @@ class WebAuthnRunner:
                 self.state.record_submission(
                     SubmissionRecord(
                         timestamp=submission["timestamp"],
+                        request_id=request_id,
                         method=method,
                         url=request.url,
                         mutated=mutated,
+                        request_headers=submission["request_headers"],
+                        request_body=submission["request_body"],
+                        frame=submission["frame"],
                         original_json=original,
                         final_json=final_payload,
+                        mutation_details=details,
+                        mutation_errors=errors,
+                        mutation_diff=mutation_diff,
+                        parse_error=parse_error,
                     )
                 )
                 self._flush_report(report, reason="submission")
-                self._log(
-                    f"submission {method} {request.url} mutated={mutated}"
-                )
-                if self.cfg.stop_after_first_webauthn:
-                    self._request_stop(
-                        report,
-                        "captured first WebAuthn submission in mutation mode",
-                    )
+                self._log(f"submission {request_id} {method} {request.url} mutated={mutated}")
+
                 if mutated and details:
                     self._log(f"mutation details: {'; '.join(details)}")
                 if errors:
                     self._log(f"mutation errors: {'; '.join(errors)}")
+
+                if self.cfg.stop_on_first_submission:
+                    self._request_stop(report, "captured first WebAuthn submission")
+                max_attempts = self.cfg.max_attempts
+                if isinstance(max_attempts, int) and max_attempts > 0:
+                    if len(report["submissions"]) >= max_attempts:
+                        self._request_stop(report, f"max attempts reached ({max_attempts})")
 
                 if mutated:
                     final_body = json.dumps(final_payload, separators=(",", ":"))
@@ -470,7 +780,6 @@ class WebAuthnRunner:
             except Exception as exc:
                 self._record_error(report, f"Route interception error: {exc}")
                 route.continue_()
-                return
 
         context.route("**/*", handle_route)
 
@@ -479,32 +788,124 @@ class WebAuthnRunner:
     ) -> None:
         def handle_response(response) -> None:
             try:
-                method = response.request.method.upper()
-                if method not in {"POST", "PUT", "PATCH"}:
+                request = response.request
+                request_key = self._request_key(request)
+                request_id = self._request_ids.get(request_key)
+                if request_id is None:
                     return
-                content_type = response.headers.get("content-type", "")
-                if "json" not in content_type.lower():
-                    return
+
                 try:
                     body = response.text()
                 except BaseException:
                     body = None
 
+                outcome = classify_application_response(response.status, body)
+                body_preview = body[:4000] if isinstance(body, str) else None
+
                 entry = {
                     "timestamp": _now(),
+                    "request_id": request_id,
                     "url": response.url,
                     "status": response.status,
                     "ok": response.ok,
-                    "method": method,
-                    "body_preview": (body[:2000] if isinstance(body, str) else None),
+                    "method": request.method.upper(),
+                    "response_headers": dict(response.headers),
+                    "body_preview": body_preview,
+                    "transport_success": outcome.transport_success,
+                    "application_status": outcome.application_status,
+                    "application_error_strings": outcome.error_strings,
+                    "application_component": outcome.component,
                 }
                 report["responses"].append(entry)
                 self.state.record_response(entry)
+
+                if isinstance(outcome.parsed_json, (dict, list)):
+                    challenges = extract_challenges(outcome.parsed_json)
+                    for challenge in challenges:
+                        observation = {
+                            "timestamp": _now(),
+                            "request_id": request_id,
+                            "url": response.url,
+                            "challenge": challenge,
+                            "reissued": False,
+                        }
+                        previous = self._challenge_last_seen.get(response.url)
+                        if previous is not None and previous != challenge:
+                            observation["reissued"] = True
+                        self._challenge_last_seen[response.url] = challenge
+                        report["challenge_observations"].append(observation)
+
+                self._update_loop_detection(report, entry)
                 self._flush_report(report, reason="response")
                 self._log(
-                    f"response {method} {response.url} status={response.status} ok={response.ok}"
+                    "response "
+                    f"{request_id} {entry['method']} {response.url} "
+                    f"status={response.status} app={outcome.application_status}"
                 )
+
+                if self.cfg.stop_on_first_response:
+                    self._request_stop(report, "captured first correlated response")
+                if self.cfg.stop_on_response_error and outcome.application_status == "rejected":
+                    self._request_stop(report, "response classified as application rejection")
             except BaseException:
                 return
 
         context.on("response", handle_response)
+
+    def _update_loop_detection(self, report: dict[str, Any], response_entry: dict[str, Any]) -> None:
+        component = response_entry.get("application_component")
+        errors = response_entry.get("application_error_strings") or []
+        error_key = "|".join(errors) if isinstance(errors, list) else ""
+        fingerprint = self._loop_body_fingerprint(response_entry.get("body_preview"))
+        signature = (
+            response_entry.get("url"),
+            component,
+            error_key,
+            self.cfg.profile,
+            fingerprint,
+        )
+        now_mono = time.monotonic()
+        self._recent_cycles.append({"ts": now_mono, "signature": signature})
+        window = max(0.1, self.cfg.loop_detection_window_seconds)
+        self._recent_cycles = [
+            item for item in self._recent_cycles if now_mono - item["ts"] <= window
+        ]
+        count = sum(1 for item in self._recent_cycles if item["signature"] == signature)
+        if count >= max(2, self.cfg.loop_detection_threshold):
+            report["loop_detection"] = {
+                "detected": True,
+                "signature": {
+                    "url": signature[0],
+                    "component": signature[1],
+                    "error": signature[2],
+                    "profile": signature[3],
+                },
+                "count": count,
+            }
+            self._request_stop(report, "frontend auto-retry loop detected")
+
+    def _loop_body_fingerprint(self, body_preview: Any) -> str:
+        if not isinstance(body_preview, str):
+            return stable_body_fingerprint(body_preview)
+        try:
+            parsed = json.loads(body_preview)
+        except Exception:
+            return stable_body_fingerprint(body_preview)
+        normalized = self._normalize_loop_value(parsed)
+        return stable_body_fingerprint(
+            json.dumps(normalized, sort_keys=True, separators=(",", ":"))
+        )
+
+    def _normalize_loop_value(self, value: Any) -> Any:
+        if isinstance(value, dict):
+            out: dict[str, Any] = {}
+            for key, item in value.items():
+                lowered = key.lower()
+                if lowered in {"challenge", "timestamp", "last_used", "issued_at"}:
+                    out[key] = "<dynamic>"
+                    continue
+                out[key] = self._normalize_loop_value(item)
+            return out
+        if isinstance(value, list):
+            return [self._normalize_loop_value(item) for item in value]
+        return value
