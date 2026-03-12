@@ -7,6 +7,7 @@ from typing import Any, Literal
 
 CeremonyType = Literal["register", "auth"]
 RunMode = Literal["normal", "mutation"]
+ColorMode = Literal["auto", "always", "never"]
 
 
 @dataclass(slots=True)
@@ -92,6 +93,7 @@ class RunConfig:
     ceremony: CeremonyType
     url: str
     mode: RunMode = "normal"
+    color_mode: ColorMode = "auto"
     profile: str = "baseline"
     chromium_executable: str | None = None
     cdp_url: str | None = None

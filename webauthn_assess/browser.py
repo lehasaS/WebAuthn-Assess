@@ -11,6 +11,7 @@ from urllib.parse import urlparse
 from playwright.sync_api import BrowserContext, CDPSession, Page, sync_playwright
 
 from .config import RunConfig
+from .encoding import b64url_decode
 from .instrumentation import build_init_script
 from .mutation import contains_webauthn_payload, mutate_json_payload
 from .persistence import atomic_write_json
@@ -21,6 +22,7 @@ from .reporting import (
     stable_body_fingerprint,
 )
 from .state import StateStore, SubmissionRecord
+from .terminal import colorize, resolve_color_enabled
 
 
 def _now() -> str:
@@ -40,19 +42,70 @@ class WebAuthnRunner:
     def __init__(self, run_config: RunConfig, state: StateStore) -> None:
         self.cfg = run_config
         self.state = state
+        self._color_enabled = resolve_color_enabled(self.cfg.color_mode)
         self._request_ids: dict[str, str] = {}
         self._recent_cycles: list[dict[str, Any]] = []
         self._challenge_last_seen: dict[str, str] = {}
         self._seen_js_event_keys: set[str] = set()
 
-    def _log(self, message: str) -> None:
+    def _log(self, message: str, *, kind: str | None = None) -> None:
         if not self.cfg.verbose:
             return
-        print(f"[webauthn-assess] {message}", flush=True)
+        level = kind or self._infer_log_kind(message)
+        prefix = colorize(
+            "[webauthn-assess]",
+            fg="cyan",
+            bold=True,
+            enabled=self._color_enabled,
+        )
+        body = self._style_log_message(message, level)
+        print(f"{prefix} {body}", flush=True)
+
+    def _infer_log_kind(self, message: str) -> str:
+        lowered = message.lower()
+        if lowered.startswith("error") or "error:" in lowered or "failed" in lowered:
+            return "error"
+        if lowered.startswith("stop requested") or "max attempts reached" in lowered:
+            return "warn"
+        if lowered.startswith("response "):
+            if "app=accepted" in lowered:
+                return "success"
+            if "app=rejected" in lowered:
+                return "error"
+            return "info"
+        if lowered.startswith("submission "):
+            return "submission"
+        if lowered.startswith("mutation"):
+            return "mutation"
+        if lowered.startswith("checkpoint saved"):
+            return "dim"
+        if lowered.startswith("cdp event"):
+            return "cdp"
+        if lowered.startswith("console[warning"):
+            return "warn"
+        if lowered.startswith("console[error"):
+            return "error"
+        if lowered.startswith("console["):
+            return "dim"
+        return "info"
+
+    def _style_log_message(self, message: str, kind: str) -> str:
+        palette: dict[str, dict[str, Any]] = {
+            "info": {"fg": "white"},
+            "success": {"fg": "green", "bold": True},
+            "warn": {"fg": "yellow", "bold": True},
+            "error": {"fg": "red", "bold": True},
+            "submission": {"fg": "blue", "bold": True},
+            "mutation": {"fg": "magenta"},
+            "cdp": {"fg": "cyan"},
+            "dim": {"dim": True},
+        }
+        style = palette.get(kind, palette["info"])
+        return colorize(message, enabled=self._color_enabled, **style)
 
     def _record_error(self, report: dict[str, Any], message: str) -> None:
         report["errors"].append(message)
-        self._log(f"ERROR {message}")
+        self._log(f"ERROR {message}", kind="error")
         self._flush_report(report, reason="error")
 
     def _request_stop(self, report: dict[str, Any], reason: str) -> None:
@@ -116,6 +169,7 @@ class WebAuthnRunner:
             f"start ceremony={self.cfg.ceremony} mode={self.cfg.mode} "
             f"profile={self.cfg.profile} url={self.cfg.url}"
         )
+        self._log_run_plan()
 
         try:
             with sync_playwright() as playwright:
@@ -220,6 +274,59 @@ class WebAuthnRunner:
         if run_exception is not None:
             raise run_exception
         return report
+
+    def _log_run_plan(self) -> None:
+        auth = self.cfg.authenticator
+        self._log(
+            "authenticator state: "
+            f"protocol={auth.protocol} transport={auth.transport} "
+            f"resident_key={auth.has_resident_key} uv_support={auth.has_user_verification} "
+            f"uv_state={auth.is_user_verified} presence_sim={auth.automatic_presence_simulation}",
+            kind="info",
+        )
+        self._log(
+            "stop guards: "
+            f"max_attempts={self.cfg.max_attempts} "
+            f"first_submission={self.cfg.stop_on_first_submission} "
+            f"first_response={self.cfg.stop_on_first_response} "
+            f"response_error={self.cfg.stop_on_response_error} "
+            f"first_cdp={self.cfg.stop_on_first_cdp_event} "
+            f"keep_open={self.cfg.keep_open}",
+            kind="info",
+        )
+        pre_items = {
+            key: value
+            for key, value in self.cfg.mutation.pre_ceremony_summary().items()
+            if value is not None
+        }
+        post_items = {
+            key: value
+            for key, value in self.cfg.mutation.post_ceremony_summary().items()
+            if value not in (None, False)
+        }
+        if self.cfg.mode == "mutation" and self.cfg.mutation.enabled:
+            self._log("active attack profile details:", kind="mutation")
+            if pre_items:
+                self._log(
+                    "  pre-ceremony mutations: "
+                    + ", ".join(f"{k}={v}" for k, v in sorted(pre_items.items())),
+                    kind="mutation",
+                )
+            if post_items:
+                self._log(
+                    "  post-ceremony mutations: "
+                    + ", ".join(f"{k}={v}" for k, v in sorted(post_items.items())),
+                    kind="mutation",
+                )
+            if not pre_items and not post_items:
+                self._log("  mutation mode enabled but no concrete mutation fields are set", kind="warn")
+        else:
+            self._log("mutation stage: disabled (capture/baseline mode)", kind="dim")
+        self._log(
+            "user action: complete the login flow in browser (password + authenticator prompts) "
+            f"within {self.cfg.wait_seconds:.1f}s",
+            kind="info",
+        )
 
     def _open_browser_session(self, playwright, report: dict[str, Any]):
         if self.cfg.cdp_url:
@@ -504,6 +611,8 @@ class WebAuthnRunner:
             report["js_events"].extend(new_events)
             for event in new_events:
                 self.state.update_from_js_event(event)
+                if self.cfg.verbose:
+                    self._log_js_event(event)
             self._flush_report(report, reason=reason)
 
         status = self._collect_js_status(page)
@@ -824,6 +933,8 @@ class WebAuthnRunner:
                     self._log(f"mutation details: {'; '.join(details)}")
                 if errors:
                     self._log(f"mutation errors: {'; '.join(errors)}")
+                if mutated and mutation_diff.get("changed"):
+                    self._log_mutation_diff(mutation_diff)
 
                 if self.cfg.stop_on_first_submission:
                     self._request_stop(report, "captured first WebAuthn submission")
@@ -988,3 +1099,126 @@ class WebAuthnRunner:
         if isinstance(value, list):
             return [self._normalize_loop_value(item) for item in value]
         return value
+
+    def _log_mutation_diff(self, diff: dict[str, Any]) -> None:
+        operations = diff.get("operations")
+        if not isinstance(operations, list) or not operations:
+            return
+        self._log(f"mutation diff operations={len(operations)}", kind="mutation")
+        for op in operations[:8]:
+            if not isinstance(op, dict):
+                continue
+            path = op.get("path", "<unknown>")
+            action = op.get("op", "replace")
+            before = self._format_diff_value(op.get("before"))
+            after = self._format_diff_value(op.get("after"))
+            self._log(f"  {action} {path}", kind="mutation")
+            self._log(f"    before: {before}", kind="dim")
+            self._log(f"    after : {after}", kind="dim")
+        if len(operations) > 8:
+            self._log(f"  ... {len(operations) - 8} more changes omitted", kind="dim")
+
+    def _format_diff_value(self, value: Any) -> str:
+        if value is None:
+            return "null"
+        if isinstance(value, (bool, int, float)):
+            return str(value)
+        if isinstance(value, str):
+            if len(value) > 220:
+                return value[:140] + "..." + value[-40:]
+            return value
+        if not isinstance(value, dict):
+            return str(value)
+
+        value_type = value.get("type")
+        if value_type == "string":
+            decoded_client = value.get("decoded_client_data")
+            if isinstance(decoded_client, dict):
+                details = []
+                for key in ("type", "origin", "challenge"):
+                    if key in decoded_client:
+                        details.append(f"{key}={decoded_client[key]}")
+                if details:
+                    return "clientData(" + ", ".join(details) + ")"
+            decoded_auth = value.get("decoded_authenticator_data")
+            if isinstance(decoded_auth, dict):
+                return (
+                    "authData("
+                    f"UP={decoded_auth.get('up')}, "
+                    f"UV={decoded_auth.get('uv')}, "
+                    f"signCount={decoded_auth.get('sign_count')})"
+                )
+            if "value" in value:
+                text = str(value["value"])
+                if len(text) > 220:
+                    return text[:140] + "..." + text[-40:]
+                return text
+            if "preview" in value:
+                return str(value["preview"])
+            return f"string(len={value.get('length')}, sha256={value.get('sha256')})"
+        if value_type == "object":
+            return f"object(keys={value.get('keys')})"
+        if value_type == "array":
+            return f"array(len={value.get('length')})"
+        return str(value)
+
+    def _log_js_event(self, event: dict[str, Any]) -> None:
+        stage = event.get("stage")
+        ceremony = event.get("ceremony")
+        method = event.get("method")
+        source = event.get("source")
+        prefix = f"js event {stage}/{ceremony} method={method} source={source}"
+        if stage == "call":
+            options = event.get("options")
+            if isinstance(options, dict):
+                public_key = options.get("publicKey")
+                if isinstance(public_key, dict):
+                    rp_id = public_key.get("rpId")
+                    uv = public_key.get("userVerification")
+                    challenge = public_key.get("challenge")
+                    challenge_len = len(challenge) if isinstance(challenge, str) else None
+                    prefix += (
+                        f" rpId={rp_id} userVerification={uv} challenge_len={challenge_len}"
+                    )
+            self._log(prefix, kind="info")
+            return
+
+        if stage == "result":
+            credential = event.get("credential")
+            if isinstance(credential, dict):
+                cred_id = credential.get("id")
+                auth_data = (
+                    credential.get("response", {}).get("authenticatorData")
+                    if isinstance(credential.get("response"), dict)
+                    else None
+                )
+                prefix += f" credential_id={cred_id}"
+                summary = self._decode_auth_data_summary(auth_data)
+                if summary:
+                    prefix += f" {summary}"
+            self._log(prefix, kind="success")
+            return
+
+        if stage == "error":
+            error = event.get("error")
+            if isinstance(error, dict):
+                prefix += f" error={error.get('name')}: {error.get('message')}"
+            self._log(prefix, kind="error")
+            return
+
+        self._log(prefix, kind="dim")
+
+    def _decode_auth_data_summary(self, auth_data_b64url: Any) -> str | None:
+        if not isinstance(auth_data_b64url, str):
+            return None
+        try:
+            raw = b64url_decode(auth_data_b64url)
+        except Exception:
+            return None
+        if len(raw) < 37:
+            return None
+        flags = raw[32]
+        sign_count = int.from_bytes(raw[33:37], "big")
+        up = bool(flags & 0x01)
+        uv = bool(flags & 0x04)
+        return f"flags=0x{flags:02x} UP={up} UV={uv} signCount={sign_count}"

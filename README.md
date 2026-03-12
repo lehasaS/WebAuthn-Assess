@@ -90,6 +90,7 @@ webauthn-assess register --url https://target/app --mode mutation --profile alg-
 ```bash
 webauthn-assess replay --capture last-assertion
 webauthn-assess clone --credential <credential-id>
+webauthn-assess inspect-state --state-path .webauthn_assess/state.json
 ```
 
 ## Useful flags
@@ -99,7 +100,8 @@ webauthn-assess clone --credential <credential-id>
 - Mutation mode uses profile-specific stop guards by default (use `--allow-retries` to disable them)
 - `--headless`: run without UI
 - `--keep-open`: keep browser/context open after initial capture until `Ctrl+C`
-- `--verbose`: stream live request/response and mutation logs in terminal
+- `--verbose`: stream live run-plan, JS ceremony, request/response, and mutation-diff logs in terminal
+- `--color auto|always|never`: colorize CLI/verbose output (defaults to `auto`)
 - `--proxy http://127.0.0.1:8080`: route traffic through local proxy/Burp
 - `--output report.json`: explicit report file path
 - `--preload-credential <credentialId>`: preload a stored CDP credential into the virtual authenticator
@@ -173,6 +175,13 @@ Reports include:
 - transport/application-level response classification
 - final state capture (URL/component/error text preview)
 - loop detection and challenge reissue observations
+
+Verbose terminal logging highlights:
+- active profile and authenticator state
+- stop-guard configuration and expected user action window
+- JS ceremony call/result/error events (including `authenticatorData` UP/UV/signCount summary when available)
+- mutation operations with before/after values
+- color-coded request/response outcomes (`accepted`, `rejected`, warnings, errors)
 
 ## Assessment checklist (recommended order)
 

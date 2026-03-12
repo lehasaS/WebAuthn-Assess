@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import signal
+import sys
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -13,11 +14,112 @@ from .persistence import atomic_write_json
 from .profiles import ProfileDefaults, get_profile, get_profile_defaults, profile_names
 from .replay import replay_submission, select_submission
 from .state import StateStore
+from .terminal import colorize, resolve_color_enabled
+
+
+_COLOR_ENABLED = False
+
+
+def _set_color_mode(mode: str) -> None:
+    global _COLOR_ENABLED
+    _COLOR_ENABLED = resolve_color_enabled(mode, stream=sys.stdout)
+
+
+def _tone(text: str, kind: str = "plain") -> str:
+    palette = {
+        "plain": {},
+        "dim": {"dim": True},
+        "info": {"fg": "cyan"},
+        "accent": {"fg": "blue", "bold": True},
+        "success": {"fg": "green", "bold": True},
+        "warn": {"fg": "yellow", "bold": True},
+        "error": {"fg": "red", "bold": True},
+    }
+    style = palette.get(kind, {})
+    return colorize(text, enabled=_COLOR_ENABLED, **style)
+
+
+def _emit(text: str, kind: str = "plain") -> None:
+    print(_tone(text, kind))
+
+
+def _emit_kv(label: str, value: Any, *, value_kind: str = "plain") -> None:
+    print(f"{_tone(label + ':', 'accent')} {_tone(str(value), value_kind)}")
+
+
+def _format_value_summary(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, (bool, int, float)):
+        return str(value)
+    if isinstance(value, str):
+        if len(value) > 200:
+            return value[:120] + "..." + value[-32:]
+        return value
+    if not isinstance(value, dict):
+        return str(value)
+
+    value_type = value.get("type")
+    if value_type == "string":
+        decoded_client = value.get("decoded_client_data")
+        if isinstance(decoded_client, dict):
+            parts = []
+            for key in ("type", "origin", "challenge"):
+                if key in decoded_client:
+                    parts.append(f"{key}={decoded_client.get(key)}")
+            if parts:
+                return "clientData(" + ", ".join(parts) + ")"
+        decoded_auth = value.get("decoded_authenticator_data")
+        if isinstance(decoded_auth, dict):
+            flags = decoded_auth.get("flags")
+            up = decoded_auth.get("up")
+            uv = decoded_auth.get("uv")
+            sign_count = decoded_auth.get("sign_count")
+            return (
+                f"authData(flags={flags}, UP={up}, UV={uv}, signCount={sign_count})"
+            )
+        if "value" in value:
+            text = str(value["value"])
+            if len(text) > 200:
+                return text[:120] + "..." + text[-32:]
+            return text
+        if "preview" in value:
+            return str(value["preview"])
+        sha = value.get("sha256")
+        length = value.get("length")
+        return f"string(len={length}, sha256={sha})"
+    if value_type == "object":
+        keys = value.get("keys")
+        return f"object(keys={keys})"
+    if value_type == "array":
+        length = value.get("length")
+        return f"array(len={length})"
+    return str(value)
+
+
+def _emit_mutation_diff(diff: dict[str, Any], *, indent: str = "  ", limit: int = 8) -> None:
+    operations = diff.get("operations")
+    if not isinstance(operations, list) or not operations:
+        return
+    shown = operations[:limit]
+    for op in shown:
+        if not isinstance(op, dict):
+            continue
+        path = op.get("path", "<unknown>")
+        action = op.get("op", "replace")
+        before = _format_value_summary(op.get("before"))
+        after = _format_value_summary(op.get("after"))
+        _emit(f"{indent}{action} {path}", "info")
+        _emit(f"{indent}  before: {before}", "dim")
+        _emit(f"{indent}  after : {after}", "dim")
+    if len(operations) > limit:
+        _emit(f"{indent}... {len(operations) - limit} more changes", "dim")
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    _set_color_mode(getattr(args, "color", "auto"))
 
     if args.command in {"register", "auth"}:
         return _run_browser_command(args)
@@ -36,6 +138,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="webauthn-assess",
         description="Compact WebAuthn assessment tool using Chromium virtual authenticators",
+    )
+    parser.add_argument(
+        "--color",
+        choices=["auto", "always", "never"],
+        default="auto",
+        help="Terminal color mode for CLI output",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -295,9 +403,10 @@ def _run_browser_command(args: argparse.Namespace) -> int:
         from .browser import WebAuthnRunner
     except ModuleNotFoundError as exc:
         if exc.name == "playwright":
-            print(
+            _emit(
                 "playwright is not installed. Install dependencies and run: "
-                "`pip install -e .` then `playwright install chromium`"
+                "`pip install -e .` then `playwright install chromium`",
+                "error",
             )
             return 1
         raise
@@ -308,16 +417,16 @@ def _run_browser_command(args: argparse.Namespace) -> int:
     _apply_mutation_overrides(mutation, args)
 
     if args.cdp_url and args.attach_pid is not None:
-        print("use either --cdp-url or --attach-pid, not both")
+        _emit("use either --cdp-url or --attach-pid, not both", "error")
         return 1
 
     cdp_url = args.cdp_url
     if args.attach_pid is not None:
         cdp_url, err = _resolve_cdp_url_from_pid(args.attach_pid)
         if not cdp_url:
-            print(f"unable to attach to pid {args.attach_pid}: {err}")
+            _emit(f"unable to attach to pid {args.attach_pid}: {err}", "error")
             return 1
-        print(f"attach pid {args.attach_pid} -> {cdp_url}")
+        _emit(f"attach pid {args.attach_pid} -> {cdp_url}", "info")
 
     mode = args.mode
     if mode == "normal":
@@ -359,6 +468,7 @@ def _run_browser_command(args: argparse.Namespace) -> int:
         ceremony=args.command,
         url=args.url,
         mode=mode,
+        color_mode=args.color,
         profile=args.profile,
         chromium_executable=(None if cdp_url else args.chromium_executable),
         cdp_url=cdp_url,
@@ -398,33 +508,61 @@ def _run_browser_command(args: argparse.Namespace) -> int:
             )
             report = WebAuthnRunner(cfg, state).run()
     except KeyboardInterrupt:
-        print(f"report: {output_path}")
+        _emit_kv("report", output_path, value_kind="info")
         if args.keep_open:
-            print("keep-open session ended by user; report was checkpointed")
+            _emit("keep-open session ended by user; report was checkpointed", "warn")
             return 0
-        print("interrupted; partial state/report was checkpointed")
+        _emit("interrupted; partial state/report was checkpointed", "warn")
         return 130
     except Exception as exc:
-        print(f"report: {output_path}")
-        print(f"run failed: {exc}")
+        _emit_kv("report", output_path, value_kind="info")
+        _emit(f"run failed: {exc}", "error")
         return 1
 
     atomic_write_json(output_path, report)
 
-    print(f"report: {output_path}")
-    print(f"js events: {len(report.get('js_events', []))}")
-    print(f"submissions: {len(report.get('submissions', []))}")
+    _emit_kv("report", output_path, value_kind="info")
+    _emit_kv("profile", report.get("profile"), value_kind="info")
+    _emit_kv("mode", report.get("mode"), value_kind="info")
+    _emit_kv("js events", len(report.get("js_events", [])))
+    _emit_kv("submissions", len(report.get("submissions", [])))
     mutated = sum(1 for s in report.get("submissions", []) if s.get("mutated"))
-    print(f"mutated submissions: {mutated}")
-    print(f"responses: {len(report.get('responses', []))}")
+    _emit_kv(
+        "mutated submissions",
+        mutated,
+        value_kind="warn" if mutated else "plain",
+    )
+    _emit_kv("responses", len(report.get("responses", [])))
     if report.get("capture_status"):
-        print(f"capture status: {report['capture_status']}")
+        capture_status = str(report["capture_status"])
+        capture_kind = "success" if capture_status == "succeeded" else "warn"
+        _emit_kv("capture status", capture_status, value_kind=capture_kind)
     if report.get("result_classification"):
-        print(f"result classification: {report['result_classification']}")
+        classification = str(report["result_classification"])
+        classification_kind = (
+            "success"
+            if classification in {"accepted", "redirected"}
+            else "error"
+            if "rejected" in classification
+            else "warn"
+        )
+        _emit_kv("result classification", classification, value_kind=classification_kind)
+    if mutated:
+        _emit("mutation operations (captured):", "accent")
+        for submission in report.get("submissions", []):
+            if not isinstance(submission, dict) or not submission.get("mutated"):
+                continue
+            request_id = submission.get("request_id", "<unknown>")
+            method = submission.get("method", "")
+            url = submission.get("url", "")
+            _emit(f"  {request_id} {method} {url}", "info")
+            diff = submission.get("mutation_diff")
+            if isinstance(diff, dict):
+                _emit_mutation_diff(diff, indent="    ")
     if report.get("errors"):
-        print("errors:")
+        _emit("errors:", "error")
         for err in report["errors"]:
-            print(f"  - {err}")
+            _emit(f"  - {err}", "error")
     return 0
 
 
@@ -432,20 +570,35 @@ def _run_replay(args: argparse.Namespace) -> int:
     state = StateStore(args.state_path)
     submissions = state.data.get("submissions", [])
     if not isinstance(submissions, list):
-        print("state does not contain submissions")
+        _emit("state does not contain submissions", "error")
         return 1
 
     submission = select_submission(submissions, args.capture)
     if submission is None:
-        print(f"no submission matched selector: {args.capture}")
+        _emit(f"no submission matched selector: {args.capture}", "error")
         return 1
 
     try:
         headers = _parse_header_overrides(args.header)
         json_overrides = _parse_json_overrides(args.json_override)
     except ValueError as exc:
-        print(str(exc))
+        _emit(str(exc), "error")
         return 1
+
+    _emit("replay plan:", "accent")
+    _emit_kv("capture", args.capture, value_kind="info")
+    _emit_kv("request id", submission.get("request_id"), value_kind="info")
+    _emit_kv("method", args.method or submission.get("method", "POST"), value_kind="info")
+    _emit_kv("target", args.url_override or submission.get("url"), value_kind="info")
+    _emit_kv("repeat", args.repeat, value_kind="info")
+    if json_overrides:
+        _emit("JSON overrides:", "accent")
+        for path, value in json_overrides.items():
+            _emit(f"  {path} = {value}", "info")
+    mutation_diff = submission.get("mutation_diff")
+    if isinstance(mutation_diff, dict) and mutation_diff.get("changed"):
+        _emit("captured mutation diff (from original run):", "accent")
+        _emit_mutation_diff(mutation_diff, indent="  ")
 
     result = replay_submission(
         submission=submission,
@@ -465,11 +618,26 @@ def _run_replay(args: argparse.Namespace) -> int:
 
     if args.output:
         atomic_write_json(args.output, {"submission": submission, "result": result})
-        print(f"replay report: {args.output}")
+        _emit_kv("replay report", args.output, value_kind="info")
 
-    print(f"replay status: {result['status']} ok={result['ok']}")
-    print(f"target: {result['url']}")
-    print(f"attempts: {len(result.get('attempts', []))}")
+    replay_kind = "success" if result.get("ok") else "error"
+    _emit_kv(
+        "replay status",
+        f"{result['status']} ok={result['ok']}",
+        value_kind=replay_kind,
+    )
+    _emit_kv("target", result["url"], value_kind="info")
+    attempts = result.get("attempts", [])
+    _emit_kv("attempts", len(attempts))
+    if isinstance(attempts, list):
+        for attempt in attempts:
+            if not isinstance(attempt, dict):
+                continue
+            status = attempt.get("status")
+            ok = bool(attempt.get("ok"))
+            elapsed_ms = attempt.get("elapsed_ms")
+            line = f"  attempt #{attempt.get('attempt')} status={status} ok={ok} elapsed_ms={elapsed_ms}"
+            _emit(line, "success" if ok else "warn")
     return 0 if result["ok"] else 2
 
 
@@ -478,9 +646,9 @@ def _run_clone(args: argparse.Namespace) -> int:
     clone_id = args.clone_id or f"{args.credential}-clone"
     ok = state.clone_credential(args.credential, clone_id)
     if not ok:
-        print(f"credential not found: {args.credential}")
+        _emit(f"credential not found: {args.credential}", "error")
         return 1
-    print(f"cloned credential {args.credential} -> {clone_id}")
+    _emit(f"cloned credential {args.credential} -> {clone_id}", "success")
     return 0
 
 
@@ -495,62 +663,88 @@ def _run_inspect_state(args: argparse.Namespace) -> int:
     virtual = data.get("virtual_credentials", [])
     profile_history = data.get("profile_history", [])
 
-    print(f"state path: {args.state_path}")
-    print(f"credentials: {len(credentials) if isinstance(credentials, dict) else 0}")
+    _emit_kv("state path", args.state_path, value_kind="info")
+    _emit_kv("credentials", len(credentials) if isinstance(credentials, dict) else 0)
     if isinstance(credentials, dict):
         for cred_id, item in credentials.items():
             sign_count = item.get("signCount") if isinstance(item, dict) else None
             cloned_from = item.get("cloned_from") if isinstance(item, dict) else None
-            print(f"  - id={cred_id} signCount={sign_count} cloned_from={cloned_from}")
+            _emit(
+                f"  - id={cred_id} signCount={sign_count} cloned_from={cloned_from}",
+                "info",
+            )
 
-    print(f"virtual credentials: {len(virtual) if isinstance(virtual, list) else 0}")
+    _emit_kv("virtual credentials", len(virtual) if isinstance(virtual, list) else 0)
     if isinstance(virtual, list):
         for item in virtual:
             if not isinstance(item, dict):
                 continue
-            print(
+            _emit(
                 "  - "
                 f"credentialId={item.get('credentialId')} "
                 f"rpId={item.get('rpId')} "
                 f"signCount={item.get('signCount')} "
-                f"cloned_from={item.get('cloned_from')}"
+                f"cloned_from={item.get('cloned_from')}",
+                "info",
             )
 
     last_registration = data.get("last_registration")
     last_assertion = data.get("last_assertion")
-    print(f"last registration present: {bool(last_registration)}")
+    _emit_kv("last registration present", bool(last_registration))
     if isinstance(last_registration, dict):
         response = last_registration.get("response")
         keys = sorted(response.keys()) if isinstance(response, dict) else []
-        print(
+        _emit(
             "  - "
             f"id={last_registration.get('id')} "
             f"type={last_registration.get('type')} "
-            f"response_keys={keys}"
+            f"response_keys={keys}",
+            "dim",
         )
-    print(f"last assertion present: {bool(last_assertion)}")
+    _emit_kv("last assertion present", bool(last_assertion))
     if isinstance(last_assertion, dict):
         response = last_assertion.get("response")
         keys = sorted(response.keys()) if isinstance(response, dict) else []
-        print(
+        _emit(
             "  - "
             f"id={last_assertion.get('id')} "
             f"type={last_assertion.get('type')} "
-            f"response_keys={keys}"
+            f"response_keys={keys}",
+            "dim",
         )
-    print(f"submissions stored: {len(data.get('submissions', []))}")
-    print(f"responses stored: {len(data.get('responses', []))}")
-    print(f"profile history entries: {len(profile_history) if isinstance(profile_history, list) else 0}")
+    submissions_stored = data.get("submissions", [])
+    responses_stored = data.get("responses", [])
+    _emit_kv("submissions stored", len(submissions_stored))
+    _emit_kv("responses stored", len(responses_stored))
+    _emit_kv(
+        "profile history entries",
+        len(profile_history) if isinstance(profile_history, list) else 0,
+    )
+    if isinstance(submissions_stored, list) and submissions_stored:
+        last = submissions_stored[-1]
+        if isinstance(last, dict):
+            _emit("last submission:", "accent")
+            _emit(
+                "  - "
+                f"{last.get('request_id')} {last.get('method')} {last.get('url')} "
+                f"mutated={last.get('mutated')}",
+                "info",
+            )
+            diff = last.get("mutation_diff")
+            if isinstance(diff, dict) and diff.get("changed"):
+                _emit("  changes:", "accent")
+                _emit_mutation_diff(diff, indent="    ", limit=5)
     if isinstance(profile_history, list) and profile_history:
         for item in profile_history[-10:]:
             if not isinstance(item, dict):
                 continue
-            print(
+            _emit(
                 "  - "
                 f"{item.get('timestamp')} "
                 f"{item.get('command')} "
                 f"profile={item.get('profile')} "
-                f"mode={item.get('mode')}"
+                f"mode={item.get('mode')}",
+                "dim",
             )
     return 0
 
