@@ -158,43 +158,51 @@ class WebAuthnRunner:
                         self._log(f"waiting {self.cfg.wait_seconds:.1f}s for ceremony activity")
                         self._wait_for_activity(page, report)
 
-                        self._capture_js_snapshot(page, report, reason="js-events")
-                        self._attach_browser_event_correlation(report)
-                        self._assess_js_capture(report)
-                        self._capture_final_state(page, report)
-                        self._classify_result(report)
-                        self._flush_report(report, reason="post-capture")
-                        self._log(f"captured {len(report['js_events'])} JS events")
+                        self._refresh_capture_state(
+                            page, report, reason="post-capture", log_summary=True
+                        )
+                        if self.cfg.keep_open:
+                            self._keep_open_until_interrupt(page, report)
+                            self._classify_result(report)
+                            self._flush_report(report, reason="keep-open-final")
                 finally:
-                    if authenticator_id and cdp is not None:
-                        self._collect_virtual_credentials(cdp, authenticator_id, report)
-                        try:
-                            cdp.send(
-                                "WebAuthn.removeVirtualAuthenticator",
-                                {"authenticatorId": authenticator_id},
-                            )
-                            self._log(f"removed virtual authenticator {authenticator_id}")
-                        except Exception:
-                            pass
-
-                    if self.cfg.cdp_url and not created_context:
-                        if page is not None:
-                            try:
-                                page.close()
-                            except Exception:
-                                pass
+                    interrupted_keep_open = bool(
+                        report.get("keep_open", {}).get("interrupted_by_user")
+                    )
+                    if interrupted_keep_open and self.cfg.keep_open:
+                        self._log(
+                            "keep-open interrupted; skipping blocking Playwright cleanup calls"
+                        )
                     else:
-                        if context is not None:
+                        if authenticator_id and cdp is not None:
+                            self._collect_virtual_credentials(cdp, authenticator_id, report)
                             try:
-                                context.close()
+                                cdp.send(
+                                    "WebAuthn.removeVirtualAuthenticator",
+                                    {"authenticatorId": authenticator_id},
+                                )
+                                self._log(f"removed virtual authenticator {authenticator_id}")
                             except Exception:
                                 pass
-                    if browser is not None:
-                        try:
-                            browser.close()
-                            self._log("browser session closed")
-                        except Exception:
-                            pass
+
+                        if self.cfg.cdp_url and not created_context:
+                            if page is not None:
+                                try:
+                                    page.close()
+                                except Exception:
+                                    pass
+                        else:
+                            if context is not None:
+                                try:
+                                    context.close()
+                                except Exception:
+                                    pass
+                        if browser is not None:
+                            try:
+                                browser.close()
+                                self._log("browser session closed")
+                            except Exception:
+                                pass
         except BaseException as exc:
             run_exception = exc
             self._record_error(report, f"Run aborted: {type(exc).__name__}: {exc}")
@@ -637,6 +645,49 @@ class WebAuthnRunner:
             page.wait_for_timeout(min(250, remaining_ms))
         self._capture_js_snapshot(page, report, reason="js-events")
 
+    def _refresh_capture_state(
+        self,
+        page: Page,
+        report: dict[str, Any],
+        *,
+        reason: str,
+        log_summary: bool = False,
+        capture_final_state: bool = True,
+    ) -> None:
+        self._capture_js_snapshot(page, report, reason="js-events")
+        self._attach_browser_event_correlation(report)
+        self._assess_js_capture(report)
+        if capture_final_state:
+            self._capture_final_state(page, report)
+        self._classify_result(report)
+        self._flush_report(report, reason=reason)
+        if log_summary:
+            self._log(f"captured {len(report['js_events'])} JS events")
+
+    def _keep_open_until_interrupt(self, page: Page, report: dict[str, Any]) -> None:
+        report["keep_open"] = {
+            "enabled": True,
+            "active": True,
+            "started_at": _now(),
+            "interrupted_by_user": False,
+        }
+        self._log("keep-open enabled; press Ctrl+C to end the session")
+        self._flush_report(report, reason="keep-open-start")
+        try:
+            while True:
+                page.wait_for_timeout(250)
+                self._capture_js_snapshot(page, report, reason="js-events")
+        except KeyboardInterrupt:
+            report["keep_open"]["interrupted_by_user"] = True
+            self._log("keep-open session interrupted by user")
+        except BaseException as exc:
+            self._log(f"keep-open session ended: {exc}")
+        finally:
+            info = report.setdefault("keep_open", {})
+            info["active"] = False
+            info["ended_at"] = _now()
+            self._flush_report(report, reason="keep-open-end")
+
     def _request_key(self, request) -> str:
         impl = getattr(request, "_impl_obj", None)
         guid = getattr(impl, "_guid", None)
@@ -702,7 +753,7 @@ class WebAuthnRunner:
                     route.continue_()
                     return
 
-                if report.get("stop_reason"):
+                if report.get("stop_reason") and not self.cfg.keep_open:
                     # Guard against frontend auto-retries after we've decided to stop.
                     route.abort()
                     return

@@ -105,6 +105,7 @@ class RunConfig:
     stop_on_first_cdp_event: bool = False
     loop_detection_window_seconds: float = 6.0
     loop_detection_threshold: int = 3
+    keep_open: bool = False
     headless: bool = False
     timeout_ms: int = 30_000
     proxy: str | None = None

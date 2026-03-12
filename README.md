@@ -98,6 +98,7 @@ webauthn-assess clone --credential <credential-id>
 - `--wait-seconds 20`: wait window for ceremony capture
 - Mutation mode uses profile-specific stop guards by default (use `--allow-retries` to disable them)
 - `--headless`: run without UI
+- `--keep-open`: keep browser/context open after initial capture until `Ctrl+C`
 - `--verbose`: stream live request/response and mutation logs in terminal
 - `--proxy http://127.0.0.1:8080`: route traffic through local proxy/Burp
 - `--output report.json`: explicit report file path

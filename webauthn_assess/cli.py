@@ -160,6 +160,14 @@ def _add_browser_args(parser: argparse.ArgumentParser, ceremony: str) -> None:
     )
 
     parser.add_argument("--headless", action="store_true", help="Launch Chromium in headless mode")
+    parser.add_argument(
+        "--keep-open",
+        action="store_true",
+        help=(
+            "Keep browser/context open after initial capture until interrupted "
+            "(useful for manual follow-on interaction)"
+        ),
+    )
     parser.add_argument("--timeout-ms", type=int, default=30_000, help="Playwright timeout in milliseconds")
     parser.add_argument("--proxy", help="Proxy server URL for browser traffic")
     parser.add_argument("--output", type=Path, help="Write report JSON to this file")
@@ -362,6 +370,7 @@ def _run_browser_command(args: argparse.Namespace) -> int:
         stop_on_first_response=stop_cfg["stop_on_first_response"],
         stop_on_response_error=stop_cfg["stop_on_response_error"],
         stop_on_first_cdp_event=stop_cfg["stop_on_first_cdp_event"],
+        keep_open=args.keep_open,
         headless=args.headless,
         timeout_ms=args.timeout_ms,
         proxy=args.proxy,
@@ -390,6 +399,9 @@ def _run_browser_command(args: argparse.Namespace) -> int:
             report = WebAuthnRunner(cfg, state).run()
     except KeyboardInterrupt:
         print(f"report: {output_path}")
+        if args.keep_open:
+            print("keep-open session ended by user; report was checkpointed")
+            return 0
         print("interrupted; partial state/report was checkpointed")
         return 130
     except Exception as exc:
