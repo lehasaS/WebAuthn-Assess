@@ -70,6 +70,8 @@ class WebAuthnRunner:
         if lowered.startswith("response "):
             if "app=accepted" in lowered:
                 return "success"
+            if "app=redirected" in lowered:
+                return "success"
             if "app=rejected" in lowered:
                 return "error"
             return "info"
@@ -727,6 +729,9 @@ class WebAuthnRunner:
 
         last = responses[-1]
         app_status = last.get("application_status")
+        if app_status == "redirected":
+            report["result_classification"] = "redirected"
+            return
         if app_status == "accepted":
             page_url = final_state.get("page_url")
             if isinstance(page_url, str) and page_url != self.cfg.url:

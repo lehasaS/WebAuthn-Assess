@@ -19,6 +19,7 @@ class AppOutcome:
 
 def classify_application_response(status: int, body: str | None) -> AppOutcome:
     transport_success = 200 <= status < 300
+    redirect_status = 300 <= status < 400
     parsed_json: dict[str, Any] | list[Any] | None = None
     component: str | None = None
     error_strings: list[str] = []
@@ -56,12 +57,17 @@ def classify_application_response(status: int, body: str | None) -> AppOutcome:
             application_status = "accepted" if ok_value else "rejected"
         elif error_strings:
             application_status = "rejected"
+        elif redirect_status:
+            application_status = "redirected"
         elif transport_success:
             application_status = "unknown"
         else:
             application_status = "rejected"
     else:
-        application_status = "accepted" if transport_success else "rejected"
+        if redirect_status:
+            application_status = "redirected"
+        else:
+            application_status = "accepted" if transport_success else "rejected"
 
     return AppOutcome(
         transport_success=transport_success,
