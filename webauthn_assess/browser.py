@@ -779,7 +779,13 @@ class WebAuthnRunner:
                 max_attempts = self.cfg.max_attempts
                 if isinstance(max_attempts, int) and max_attempts > 0:
                     if len(report["submissions"]) >= max_attempts:
-                        self._request_stop(report, f"max attempts reached ({max_attempts})")
+                        report["max_attempts_reached"] = True
+                        if len(report.get("responses", [])) >= max_attempts:
+                            self._request_stop(report, f"max attempts reached ({max_attempts})")
+                        elif self.cfg.verbose:
+                            self._log(
+                                "max attempts reached at submission boundary; waiting for correlated response"
+                            )
 
                 if mutated:
                     final_body = json.dumps(final_payload, separators=(",", ":"))
@@ -861,6 +867,14 @@ class WebAuthnRunner:
                     self._request_stop(report, "captured first correlated response")
                 if self.cfg.stop_on_response_error and outcome.application_status == "rejected":
                     self._request_stop(report, "response classified as application rejection")
+                max_attempts = self.cfg.max_attempts
+                if (
+                    isinstance(max_attempts, int)
+                    and max_attempts > 0
+                    and len(report.get("submissions", [])) >= max_attempts
+                    and len(report.get("responses", [])) >= max_attempts
+                ):
+                    self._request_stop(report, f"max attempts reached ({max_attempts})")
             except BaseException:
                 return
 
