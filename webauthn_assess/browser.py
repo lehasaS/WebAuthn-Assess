@@ -342,10 +342,24 @@ class WebAuthnRunner:
     ) -> None:
         preloaded: list[str] = []
         for credential_id in self.cfg.preload_credential_ids:
-            item = self.state.virtual_credential(credential_id)
+            item, matched_id = self.state.virtual_credential_with_id(credential_id)
             if item is None:
-                self._record_error(report, f"Preload credential not found in state: {credential_id}")
+                available = self.state.virtual_credential_ids()
+                hint = (
+                    f" available_ids={len(available)} state_path={self.cfg.state_path}"
+                )
+                if available:
+                    sample = ", ".join(available[:3])
+                    hint = f"{hint} sample=[{sample}]"
+                self._record_error(
+                    report,
+                    f"Preload credential not found in state: {credential_id}.{hint}",
+                )
                 continue
+            if matched_id and matched_id != credential_id:
+                self._log(
+                    f"preload credential id normalized: requested={credential_id} matched={matched_id}"
+                )
 
             credential = {k: v for k, v in item.items() if k in {
                 "credentialId",

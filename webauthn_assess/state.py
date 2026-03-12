@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -95,15 +96,53 @@ class StateStore:
         return self._data.get("credentials", {}).get(credential_id)
 
     def virtual_credential(self, credential_id: str) -> dict[str, Any] | None:
+        item, _matched_id = self.virtual_credential_with_id(credential_id)
+        return item
+
+    def virtual_credential_with_id(
+        self, credential_id: str
+    ) -> tuple[dict[str, Any] | None, str | None]:
         items = self._data.get("virtual_credentials", [])
         if not isinstance(items, list):
-            return None
+            return None, None
+
+        # Fast path: exact string match.
         for item in items:
             if not isinstance(item, dict):
                 continue
-            if item.get("credentialId") == credential_id:
-                return item
-        return None
+            item_id = item.get("credentialId")
+            if item_id == credential_id:
+                return item, item_id if isinstance(item_id, str) else None
+
+        # Fallback: compare decoded bytes to tolerate base64/base64url/padding variants.
+        wanted = _decode_credential_id(credential_id)
+        if wanted is None:
+            return None, None
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            item_id = item.get("credentialId")
+            if not isinstance(item_id, str):
+                continue
+            decoded = _decode_credential_id(item_id)
+            if decoded is None:
+                continue
+            if decoded == wanted:
+                return item, item_id
+        return None, None
+
+    def virtual_credential_ids(self) -> list[str]:
+        items = self._data.get("virtual_credentials", [])
+        if not isinstance(items, list):
+            return []
+        out: list[str] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            cid = item.get("credentialId")
+            if isinstance(cid, str):
+                out.append(cid)
+        return out
 
     def clone_credential(self, credential_id: str, clone_id: str) -> bool:
         source = self.credential(credential_id)
@@ -248,3 +287,29 @@ def _extract_sign_count(authenticator_data_b64url: str) -> int | None:
     if len(raw) < 37:
         return None
     return int.from_bytes(raw[33:37], "big")
+
+
+def _decode_credential_id(value: str) -> bytes | None:
+    raw = value.strip()
+    if not raw:
+        return None
+    variants = {
+        raw,
+        raw.replace("-", "+").replace("_", "/"),
+        raw.replace("+", "-").replace("/", "_"),
+    }
+    for candidate in variants:
+        padded = candidate + ("=" * (-len(candidate) % 4))
+        try:
+            decoded = base64.b64decode(padded, validate=False)
+            if decoded:
+                return decoded
+        except Exception:
+            pass
+        try:
+            decoded = base64.urlsafe_b64decode(padded)
+            if decoded:
+                return decoded
+        except Exception:
+            pass
+    return None
