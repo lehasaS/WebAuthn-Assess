@@ -687,6 +687,13 @@ def _run_inspect_state(args: argparse.Namespace) -> int:
                 f"cloned_from={item.get('cloned_from')}",
                 "info",
             )
+    if isinstance(credentials, dict) and credentials and isinstance(virtual, list) and not virtual:
+        _emit(
+            "warning: captured credential metadata exists, but no preloadable virtual "
+            "credentials were stored; auth --preload-credential requires a "
+            "virtual_credentials entry with privateKey material",
+            "warn",
+        )
 
     last_registration = data.get("last_registration")
     last_assertion = data.get("last_assertion")

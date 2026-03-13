@@ -462,12 +462,36 @@ class WebAuthnRunner:
             item, matched_id = self.state.virtual_credential_with_id(credential_id)
             if item is None:
                 available = self.state.virtual_credential_ids()
+                captured_sources: list[str] = []
+                if self.state.credential(credential_id) is not None:
+                    captured_sources.append("credentials")
+                last_registration = self.state.data.get("last_registration")
+                if isinstance(last_registration, dict):
+                    if credential_id in {
+                        last_registration.get("id"),
+                        last_registration.get("rawId"),
+                    }:
+                        captured_sources.append("last_registration")
+                last_assertion = self.state.data.get("last_assertion")
+                if isinstance(last_assertion, dict):
+                    if credential_id in {
+                        last_assertion.get("id"),
+                        last_assertion.get("rawId"),
+                    }:
+                        captured_sources.append("last_assertion")
                 hint = (
                     f" available_ids={len(available)} state_path={self.cfg.state_path}"
                 )
                 if available:
                     sample = ", ".join(available[:3])
                     hint = f"{hint} sample=[{sample}]"
+                if captured_sources:
+                    sources = ",".join(captured_sources)
+                    hint = (
+                        f"{hint} captured_only=[{sources}] "
+                        "note=credential metadata was captured but no preloadable "
+                        "virtual credential/privateKey was stored"
+                    )
                 self._record_error(
                     report,
                     f"Preload credential not found in state: {credential_id}.{hint}",
