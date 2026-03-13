@@ -194,7 +194,7 @@ class WebAuthnRunner:
                         self._record_error(report, f"CDP setup failed: {exc}")
 
                     if authenticator_id:
-                        self._attach_cdp_event_listeners(cdp, page, report)
+                        self._attach_cdp_event_listeners(cdp, page, report, authenticator_id)
 
                     try:
                         self._log("navigating to target page")
@@ -416,11 +416,27 @@ class WebAuthnRunner:
         return authenticator_id
 
     def _attach_cdp_event_listeners(
-        self, cdp: CDPSession, page: Page, report: dict[str, Any]
+        self,
+        cdp: CDPSession,
+        page: Page,
+        report: dict[str, Any],
+        authenticator_id: str,
     ) -> None:
         def _record(name: str):
             def _handler(payload: dict[str, Any]) -> None:
                 report["cdp_events"].append({"event": name, "payload": payload, "ts": _now()})
+                if name in {
+                    "WebAuthn.credentialAdded",
+                    "WebAuthn.credentialAsserted",
+                    "WebAuthn.credentialUpdated",
+                }:
+                    self._collect_virtual_credentials(
+                        cdp,
+                        authenticator_id,
+                        report,
+                        reason="virtual-credentials-live",
+                        log_summary=False,
+                    )
                 self._capture_js_snapshot(page, report, reason="js-events")
                 self._flush_report(report, reason="cdp-event")
                 if self.cfg.stop_on_first_cdp_event:
@@ -436,7 +452,13 @@ class WebAuthnRunner:
         cdp.on("WebAuthn.credentialUpdated", _record("WebAuthn.credentialUpdated"))
 
     def _collect_virtual_credentials(
-        self, cdp: CDPSession, authenticator_id: str, report: dict[str, Any]
+        self,
+        cdp: CDPSession,
+        authenticator_id: str,
+        report: dict[str, Any],
+        *,
+        reason: str = "virtual-credentials",
+        log_summary: bool = True,
     ) -> None:
         try:
             result = cdp.send(
@@ -449,8 +471,9 @@ class WebAuthnRunner:
                 self.state.record_virtual_credentials(
                     [c for c in credentials if isinstance(c, dict)]
                 )
-                self._flush_report(report, reason="virtual-credentials")
-                self._log(f"snapshot virtual credentials count={len(credentials)}")
+                self._flush_report(report, reason=reason)
+                if log_summary:
+                    self._log(f"snapshot virtual credentials count={len(credentials)}")
         except Exception as exc:
             self._record_error(report, f"Unable to query virtual credentials: {exc}")
 
