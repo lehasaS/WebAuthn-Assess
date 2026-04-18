@@ -324,6 +324,15 @@ class WebAuthnRunner:
                 self._log("  mutation mode enabled but no concrete mutation fields are set", kind="warn")
         else:
             self._log("mutation stage: disabled (capture/baseline mode)", kind="dim")
+
+        if self.cfg.profile == "uv-downgrade":
+            self._log(
+                "note: uv-downgrade flips UV after signing (post-ceremony tamper); expected rejection is due to "
+                "signature/flag mismatch, not UV policy. Use --uv-support off --uv-state off for a non-UV-capable "
+                "baseline run.",
+                kind="warn",
+            )
+
         self._log(
             "user action: complete the login flow in browser (password + authenticator prompts) "
             f"within {self.cfg.wait_seconds:.1f}s",

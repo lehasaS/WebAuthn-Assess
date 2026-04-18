@@ -450,17 +450,28 @@ def _run_browser_command(args: argparse.Namespace) -> int:
 
     stop_cfg = _resolve_stop_guards(args, mode, profile_defaults)
 
+    effective_uv_support = args.uv_support == "on"
+    effective_uv_state = args.uv_state == "on"
+    if args.command == "auth" and args.uv in {"on", "off"}:
+        effective_uv_state = args.uv == "on"
+
+    if args.command == "auth" and mode == "normal" and effective_uv_support and not effective_uv_state:
+        _emit(
+            "warning: auth with UV capability enabled but real UV state off often causes "
+            "Chromium virtual authenticators to raise NotAllowedError instead of returning "
+            "a UV=false assertion; use --uv-support off for a clean non-UV-capable device "
+            "test, or use mutation mode for post-ceremony UV tampering",
+            "warn",
+        )
+
     authenticator = AuthenticatorConfig(
         protocol=args.protocol,
         transport=args.transport,
         has_resident_key=(args.resident_key == "on"),
-        has_user_verification=(args.uv_support == "on"),
-        is_user_verified=(args.uv_state == "on"),
+        has_user_verification=effective_uv_support,
+        is_user_verified=effective_uv_state,
         automatic_presence_simulation=(args.presence_sim == "on"),
     )
-
-    if args.command == "auth" and args.uv in {"on", "off"}:
-        authenticator.is_user_verified = args.uv == "on"
 
     output_path = args.output or _default_report_path(args.command, args.profile)
 

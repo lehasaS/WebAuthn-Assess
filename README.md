@@ -192,7 +192,7 @@ Verbose terminal logging highlights:
    - `tamper-type`
    - challenge tamper (`random`, `empty`, `null`, `missing`)
 4. Run policy tests:
-   - UV semantics (`--uv off`, `uv-downgrade`)
+   - UV semantics: non-UV-capable device with `--uv-support off --uv-state off` (policy check), and `uv-downgrade` which flips UV after signing (tamper/sig-integrity check, expected to be rejected)
    - RP-ID/origin scoping (`rp-id-mismatch`)
    - attestation policy (`attestation-none`, `attestation-untrusted`)
    - algorithm policy (`alg-unexpected`)
