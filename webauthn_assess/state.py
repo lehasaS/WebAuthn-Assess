@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -17,11 +18,18 @@ def _utc_now() -> str:
 @dataclass(slots=True)
 class SubmissionRecord:
     timestamp: str
+    request_id: str
     method: str
     url: str
     mutated: bool
+    request_headers: dict[str, Any] | None
+    request_body: str | None
+    frame: dict[str, Any] | None
     original_json: dict[str, Any] | list[Any] | None
     final_json: dict[str, Any] | list[Any] | None
+    mutation_details: list[str] | None = None
+    mutation_errors: list[str] | None = None
+    mutation_diff: dict[str, Any] | None = None
     parse_error: str | None = None
 
 
@@ -43,6 +51,7 @@ class StateStore:
             "virtual_credentials": [],
             "submissions": [],
             "responses": [],
+            "profile_history": [],
         }
 
     def _load(self) -> dict[str, Any]:
@@ -87,15 +96,53 @@ class StateStore:
         return self._data.get("credentials", {}).get(credential_id)
 
     def virtual_credential(self, credential_id: str) -> dict[str, Any] | None:
+        item, _matched_id = self.virtual_credential_with_id(credential_id)
+        return item
+
+    def virtual_credential_with_id(
+        self, credential_id: str
+    ) -> tuple[dict[str, Any] | None, str | None]:
         items = self._data.get("virtual_credentials", [])
         if not isinstance(items, list):
-            return None
+            return None, None
+
+        # Fast path: exact string match.
         for item in items:
             if not isinstance(item, dict):
                 continue
-            if item.get("credentialId") == credential_id:
-                return item
-        return None
+            item_id = item.get("credentialId")
+            if item_id == credential_id:
+                return item, item_id if isinstance(item_id, str) else None
+
+        # Fallback: compare decoded bytes to tolerate base64/base64url/padding variants.
+        wanted = _decode_credential_id(credential_id)
+        if wanted is None:
+            return None, None
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            item_id = item.get("credentialId")
+            if not isinstance(item_id, str):
+                continue
+            decoded = _decode_credential_id(item_id)
+            if decoded is None:
+                continue
+            if decoded == wanted:
+                return item, item_id
+        return None, None
+
+    def virtual_credential_ids(self) -> list[str]:
+        items = self._data.get("virtual_credentials", [])
+        if not isinstance(items, list):
+            return []
+        out: list[str] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            cid = item.get("credentialId")
+            if isinstance(cid, str):
+                out.append(cid)
+        return out
 
     def clone_credential(self, credential_id: str, clone_id: str) -> bool:
         source = self.credential(credential_id)
@@ -124,11 +171,18 @@ class StateStore:
         submissions.append(
             {
                 "timestamp": submission.timestamp,
+                "request_id": submission.request_id,
                 "method": submission.method,
                 "url": submission.url,
                 "mutated": submission.mutated,
+                "request_headers": submission.request_headers,
+                "request_body": submission.request_body,
+                "frame": submission.frame,
                 "original_json": submission.original_json,
                 "final_json": submission.final_json,
+                "mutation_details": submission.mutation_details,
+                "mutation_errors": submission.mutation_errors,
+                "mutation_diff": submission.mutation_diff,
                 "parse_error": submission.parse_error,
             }
         )
@@ -217,6 +271,13 @@ class StateStore:
         if changed:
             self._autosave()
 
+    def record_profile_run(self, item: dict[str, Any]) -> None:
+        history = self._data.setdefault("profile_history", [])
+        history.append(item)
+        if len(history) > 200:
+            del history[:-200]
+        self._autosave()
+
 
 def _extract_sign_count(authenticator_data_b64url: str) -> int | None:
     try:
@@ -226,3 +287,29 @@ def _extract_sign_count(authenticator_data_b64url: str) -> int | None:
     if len(raw) < 37:
         return None
     return int.from_bytes(raw[33:37], "big")
+
+
+def _decode_credential_id(value: str) -> bytes | None:
+    raw = value.strip()
+    if not raw:
+        return None
+    variants = {
+        raw,
+        raw.replace("-", "+").replace("_", "/"),
+        raw.replace("+", "-").replace("/", "_"),
+    }
+    for candidate in variants:
+        padded = candidate + ("=" * (-len(candidate) % 4))
+        try:
+            decoded = base64.b64decode(padded, validate=False)
+            if decoded:
+                return decoded
+        except Exception:
+            pass
+        try:
+            decoded = base64.urlsafe_b64decode(padded)
+            if decoded:
+                return decoded
+        except Exception:
+            pass
+    return None

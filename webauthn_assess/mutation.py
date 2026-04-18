@@ -158,18 +158,41 @@ def _mutate_client_data_json(
         log.mark(f"{path}: tampered clientDataJSON.origin")
 
     if mutation.tamper_challenge:
-        if mutation.tamper_challenge == "stale":
-            source = state.previous_challenge(ceremony or "auth")
-            if source:
+        challenge_mode = mutation.tamper_challenge
+        if challenge_mode in {"stale", "last-assertion", "last-registration"}:
+            if challenge_mode == "last-registration":
+                source = state.previous_challenge("register")
+                source_name = "last-registration"
+            elif challenge_mode == "last-assertion":
+                source = state.previous_challenge("auth")
+                source_name = "last-assertion"
+            else:
+                source = state.previous_challenge(ceremony or "auth")
+                source_name = f"stale:{ceremony or 'auth'}"
+            if source is not None:
                 obj["challenge"] = source
                 changed = True
-                log.mark(f"{path}: replayed stale challenge")
-        elif mutation.tamper_challenge == "random":
+                log.mark(f"{path}: replaced challenge using {source_name}")
+            else:
+                log.error(f"{path}: challenge source '{source_name}' unavailable")
+        elif challenge_mode == "random":
             obj["challenge"] = b64url_encode(os.urandom(32))
             changed = True
             log.mark(f"{path}: replaced challenge with random bytes")
+        elif challenge_mode == "empty":
+            obj["challenge"] = ""
+            changed = True
+            log.mark(f"{path}: replaced challenge with empty string")
+        elif challenge_mode == "null":
+            obj["challenge"] = None
+            changed = True
+            log.mark(f"{path}: replaced challenge with null")
+        elif challenge_mode == "missing":
+            obj.pop("challenge", None)
+            changed = True
+            log.mark(f"{path}: removed challenge field")
         else:
-            obj["challenge"] = mutation.tamper_challenge
+            obj["challenge"] = challenge_mode
             changed = True
             log.mark(f"{path}: replaced challenge with provided value")
 
